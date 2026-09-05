@@ -1,0 +1,64 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>Harness</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+      html,
+      body {
+        height: 100%;
+      }
+      body {
+        display: flex;
+        flex-direction: column;
+        font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+      }
+      #log {
+        flex: 1;
+        overflow-y: auto;
+        padding: 12px;
+      }
+      #log div {
+        padding: 2px 0;
+      }
+      form {
+        display: flex;
+        padding: 8px;
+        border-top: 1px solid #ccc;
+      }
+      input {
+        flex: 1;
+        padding: 8px;
+        font-size: 14px;
+        border: 1px solid #ccc;
+        border-radius: 6px;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="log"></div>
+    <form id="prompt-form">
+      <input id="prompt-input" type="text" placeholder="Type a message…" autofocus />
+    </form>
+    <script>
+      const form = document.getElementById('prompt-form')
+      const input = document.getElementById('prompt-input')
+      const log = document.getElementById('log')
+
+      form.addEventListener('submit', (e) => {
+        e.preventDefault()
+        const text = input.value.trim()
+        if (!text) return
+        const line = document.createElement('div')
+        line.textContent = text
+        log.appendChild(line)
+        input.value = ''
+      })
+    </script>
+  </body>
+</html>
