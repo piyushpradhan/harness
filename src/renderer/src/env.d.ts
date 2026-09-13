@@ -10,3 +10,13 @@ interface Window {
     }
   }
 }
+interface Window {
+  harness: {
+    providers: { list(): Promise<Array<{ id: string; name: string }>> }
+    auth: {
+      set(id: string, key: string): Promise<void>
+      has(id: string): Promise<boolean>
+      test(id: string): Promise<boolean>
+    }
+  }
+}
