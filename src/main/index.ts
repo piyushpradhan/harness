@@ -1,6 +1,9 @@
 import { join } from 'node:path'
 
-import { BrowserWindow, app } from 'electron'
+import { BrowserWindow, app, ipcMain } from 'electron'
+import { setAuth, getAuth } from "./services/auth";
+import { listProviders } from "./services/providers";
+import { chat } from './services/llm';
 
 function createWindow(): void {
   const win = new BrowserWindow({
@@ -37,3 +40,11 @@ app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   app.quit()
 })
+
+ipcMain.handle("auth:set", (_e, providerID: string, key: string) => setAuth(providerID, key.trim()));
+ipcMain.handle("auth:get", (_e, providerID: string) => getAuth(providerID));
+ipcMain.handle("providers:list", () => listProviders());
+ipcMain.handle("auth:test", async (_e, providerID: string) => {          // verify key actually works
+  try { await chat(providerID, "models", "ping"); return true; }
+  catch { return false; }
+});

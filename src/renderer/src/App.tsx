@@ -19,9 +19,16 @@ export default function App() {
   function handleSubmit(e: FormEvent<HTMLFormElement>): void {
     e.preventDefault()
     const value = text.trim()
+    console.log("value: ", value);
+
     if (!value) return
+
+    if (value === "/connect") {
+      window.harness.auth.test("opencode-go");
+    } else {
     setEntries((prev) => [...prev, { id: Date.now(), text: value }])
     setText('')
+    }
   }
 
   return (

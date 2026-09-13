@@ -10,11 +10,17 @@ export default defineConfig({
     resolve: {
       alias: { '@shared': resolve('src/shared') },
     },
+    build: {
+      watch: { skipWrite: false },
+    },
   },
   preload: {
     plugins: [externalizeDepsPlugin()],
     resolve: {
       alias: { '@shared': resolve('src/shared') },
+    },
+    build: {
+      watch: { skipWrite: false },
     },
   },
   renderer: {
