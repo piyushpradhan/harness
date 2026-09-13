@@ -48,6 +48,7 @@
     "electron"
   ],
   "dependencies": {
+    "@shadcn/react": "^0.3.1",
     "cn": "^0.2.5",
     "radix-ui": "^1.6.7",
     "react": "^19.2.8",

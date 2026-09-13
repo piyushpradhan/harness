@@ -14,5 +14,5 @@ export function percentile(values: readonly number[], p: number): number {
   const sorted = [...values].sort((a, b) => a - b)
   const rank = Math.max(1, Math.ceil((p / 100) * sorted.length))
   // rank is always >= 1 and <= sorted.length, so this index is in bounds.
-  return sorted[rank - 1]!
+  return sorted[rank - 1]
 }

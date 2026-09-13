@@ -1,11 +1,19 @@
-import { useState, type FormEvent } from 'react'
+import { useState, type FormEvent, type KeyboardEvent } from 'react'
 
-import { Badge } from '@/components/ui/badge'
+import { TitleBar } from '@/components/title-bar'
 import { Button } from '@/components/ui/button'
-import { Card, CardContent, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
-import { Input } from '@/components/ui/input'
-import { ScrollArea } from '@/components/ui/scroll-area'
-import { Separator } from '@/components/ui/separator'
+import { Bubble, BubbleContent } from '@/components/ui/bubble'
+import { Marker, MarkerContent } from '@/components/ui/marker'
+import { Message, MessageContent } from '@/components/ui/message'
+import {
+  MessageScroller,
+  MessageScrollerButton,
+  MessageScrollerContent,
+  MessageScrollerItem,
+  MessageScrollerProvider,
+  MessageScrollerViewport,
+} from '@/components/ui/message-scroller'
+import { Textarea } from '@/components/ui/textarea'
 
 interface Entry {
   id: number
@@ -19,56 +27,80 @@ export default function App() {
   function handleSubmit(e: FormEvent<HTMLFormElement>): void {
     e.preventDefault()
     const value = text.trim()
-    console.log("value: ", value);
+    console.log('value: ', value)
 
     if (!value) return
 
-    if (value === "/connect") {
-      window.harness.auth.test("opencode-go");
+    if (value === '/connect') {
+      void window.harness.auth.test('opencode-go')
     } else {
-    setEntries((prev) => [...prev, { id: Date.now(), text: value }])
-    setText('')
+      setEntries((prev) => [...prev, { id: Date.now(), text: value }])
+      setText('')
     }
   }
 
+  function handleComposerKeyDown(e: KeyboardEvent<HTMLTextAreaElement>): void {
+    if (e.key !== 'Enter' || e.shiftKey || e.nativeEvent.isComposing) return
+    e.preventDefault()
+    e.currentTarget.form?.requestSubmit()
+  }
+
   return (
-    <div className="flex h-screen flex-col gap-4 p-4">
-      <Card className="flex min-h-0 flex-col">
-        <CardHeader className="flex flex-row items-center justify-between space-y-0">
-          <CardTitle>Harness</CardTitle>
-          <Badge variant="secondary">{window.api.platform}</Badge>
-        </CardHeader>
-        <Separator />
-        <CardContent className="min-h-0 flex-1 overflow-hidden py-4">
-          <ScrollArea className="h-full">
-            {entries.length === 0 ? (
-              <p className="text-muted-foreground text-sm">Type a message to begin…</p>
-            ) : (
-              <ul className="space-y-1">
-                {entries.map((entry) => (
-                  <li key={entry.id} className="py-1">
-                    {entry.text}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </ScrollArea>
-        </CardContent>
-        <Separator />
-        <CardFooter>
-          <form onSubmit={handleSubmit} className="flex w-full gap-2">
-            <Input
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder="Type a message…"
-              autoFocus
-            />
-            <Button type="submit" disabled={text.trim() === ''}>
-              Send
-            </Button>
-          </form>
-        </CardFooter>
-      </Card>
+    <div className="relative h-full min-h-0 text-foreground">
+      <div className="app-no-drag absolute inset-0 flex min-h-0 flex-col">
+        <MessageScrollerProvider autoScroll defaultScrollPosition="end">
+          <MessageScroller>
+            <MessageScrollerViewport aria-label="Conversation">
+              <MessageScrollerContent className="mx-auto w-full max-w-3xl gap-3 px-4 pt-[68px] pb-[88px] sm:px-6">
+                {entries.length === 0 ? (
+                  <MessageScrollerItem
+                    messageId="empty"
+                    className="flex flex-1 items-center justify-center [content-visibility:visible]"
+                  >
+                    <Marker className="justify-center">
+                      <MarkerContent>Type a message to begin</MarkerContent>
+                    </Marker>
+                  </MessageScrollerItem>
+                ) : (
+                  entries.map((entry) => (
+                    <MessageScrollerItem key={entry.id} messageId={String(entry.id)} scrollAnchor>
+                      <Message align="end">
+                        <MessageContent>
+                          <Bubble variant="default" align="end">
+                            <BubbleContent>{entry.text}</BubbleContent>
+                          </Bubble>
+                        </MessageContent>
+                      </Message>
+                    </MessageScrollerItem>
+                  ))
+                )}
+              </MessageScrollerContent>
+            </MessageScrollerViewport>
+            <MessageScrollerButton className="bg-background/70 backdrop-blur-md data-[direction=end]:bottom-[5.75rem]" />
+          </MessageScroller>
+        </MessageScrollerProvider>
+      </div>
+      <TitleBar />
+      <form
+        onSubmit={handleSubmit}
+        className="composer app-no-drag absolute inset-x-0 bottom-0 z-10 px-4 py-3 sm:px-6"
+      >
+        <div className="mx-auto flex w-full max-w-3xl items-end gap-2">
+          <Textarea
+            value={text}
+            onChange={(e) => setText(e.target.value)}
+            onKeyDown={handleComposerKeyDown}
+            placeholder="Type a message…"
+            aria-label="Message"
+            autoFocus
+            rows={1}
+            className="composer-input max-h-40 min-h-10 resize-none py-2"
+          />
+          <Button type="submit" disabled={text.trim() === ''} className="shrink-0">
+            Send
+          </Button>
+        </div>
+      </form>
     </div>
   )
 }
