@@ -2,6 +2,7 @@ import { BrowserWindow, ipcMain, type IpcMainInvokeEvent } from 'electron'
 
 import { hasAuth, setAuth } from './services/auth'
 import { testConnection } from './services/llm'
+import { onStreamEvent, sendMessage } from './services/opencode'
 import { listProviders } from './services/providers'
 
 import { createLogger } from '@shared/logger'
@@ -35,6 +36,26 @@ export function registerIpcHandlers(): void {
   ipcMain.handle('auth:test', (_event, providerId: string) => {
     log.info('testing provider connection', { provider: providerId })
     return testConnection(providerId)
+  })
+
+  // Streaming channel to OpenCode. The window that sent the message receives
+  // the stream events; the bus itself is global and filtered in the service.
+  let streamTarget: BrowserWindow | null = null
+  onStreamEvent((evt) => {
+    if (streamTarget && !streamTarget.isDestroyed()) {
+      streamTarget.webContents.send('opencode:stream', evt)
+    }
+  })
+  ipcMain.handle('opencode:send', async (event, text: string) => {
+    const win = windowFrom(event)
+    if (win) streamTarget = win
+    try {
+      await sendMessage(String(text))
+      return { ok: true }
+    } catch (err) {
+      log.error('opencode send failed', err)
+      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+    }
   })
 
   ipcMain.handle('window:minimize', (event) => {

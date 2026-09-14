@@ -1,5 +1,6 @@
 /// <reference types="vite/client" />
 
+import type { OpencodeStreamEvent } from '@shared/opencode-stream'
 import type { WindowChromeState } from '@shared/window-chrome'
 
 declare global {
@@ -26,6 +27,10 @@ declare global {
         set(id: string, key: string): Promise<void>
         has(id: string): Promise<boolean>
         test(id: string): Promise<boolean>
+      }
+      opencode: {
+        send(text: string): Promise<{ ok: boolean; error?: string }>
+        onStream(callback: (event: OpencodeStreamEvent) => void): () => void
       }
     }
   }

@@ -1,6 +1,7 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { createLogger } from '@shared/logger'
+import type { OpencodeStreamEvent } from '@shared/opencode-stream'
 
 import { Marker, MarkerContent } from '@/components/ui/marker'
 import {
@@ -18,6 +19,22 @@ import type { ChatMessage } from './types'
 
 const log = createLogger('app')
 
+/** Update the in-flight assistant message for the given stream event. */
+function applyStreamEvent(message: ChatMessage, event: OpencodeStreamEvent): ChatMessage {
+  switch (event.type) {
+    case 'text':
+      return { ...message, content: message.content + event.text }
+    case 'thinking':
+      return { ...message, reasoning: (message.reasoning ?? '') + event.text }
+    case 'done':
+      return { ...message, streaming: false }
+    case 'error':
+      return { ...message, streaming: false, content: message.content + `\n\n[${event.message}]` }
+    case 'step':
+      return message
+  }
+}
+
 /**
  * The chat screen: transcript scroller + composer.
  *
@@ -27,6 +44,19 @@ const log = createLogger('app')
  */
 export function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
+  const assistantIdRef = useRef<string | null>(null)
+
+  // One subscription for the lifetime of the chat; events arrive for the
+  // single in-flight assistant message tracked by the ref.
+  useEffect(() => {
+    return window.harness.opencode.onStream((event) => {
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantIdRef.current ? applyStreamEvent(message, event) : message,
+        ),
+      )
+    })
+  }, [])
 
   const handleSubmit = useCallback((text: string): boolean => {
     if (text === '/connect') {
@@ -35,7 +65,26 @@ export function Chat() {
       })
       return false
     }
-    setMessages((prev) => [...prev, { id: Date.now(), content: text }])
+
+    const assistantId = crypto.randomUUID()
+    assistantIdRef.current = assistantId
+    setMessages((prev) => [
+      ...prev,
+      { id: crypto.randomUUID(), role: 'user', content: text },
+      { id: assistantId, role: 'assistant', content: '', streaming: true },
+    ])
+
+    void window.harness.opencode.send(text).then((result) => {
+      if (result.ok) return
+      log.error('opencode send rejected', result.error)
+      setMessages((prev) =>
+        prev.map((message) =>
+          message.id === assistantId
+            ? { ...message, streaming: false, content: result.error ?? 'send failed' }
+            : message,
+        ),
+      )
+    })
     return true
   }, [])
 

@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
+import type { OpencodeStreamEvent } from '@shared/opencode-stream'
 import type { WindowChromeState } from '@shared/window-chrome'
 
 const api = {
@@ -35,6 +36,19 @@ const harness = {
     set: (id: string, key: string) => ipcRenderer.invoke('auth:set', id, key) as Promise<void>,
     has: (id: string) => ipcRenderer.invoke('auth:has', id) as Promise<boolean>,
     test: (id: string) => ipcRenderer.invoke('auth:test', id) as Promise<boolean>,
+  },
+  opencode: {
+    send: (text: string) =>
+      ipcRenderer.invoke('opencode:send', text) as Promise<{ ok: boolean; error?: string }>,
+    onStream: (callback: (event: OpencodeStreamEvent) => void) => {
+      const listener = (_event: unknown, evt: OpencodeStreamEvent) => {
+        callback(evt)
+      }
+      ipcRenderer.on('opencode:stream', listener)
+      return () => {
+        ipcRenderer.removeListener('opencode:stream', listener)
+      }
+    },
   },
 } as const
 

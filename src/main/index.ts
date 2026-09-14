@@ -5,6 +5,7 @@ import { BrowserWindow, app } from 'electron'
 import { createLogger } from '@shared/logger'
 
 import { readChromeState, registerIpcHandlers } from './ipc'
+import { stopServer } from './services/opencode'
 
 const log = createLogger('main')
 
@@ -98,4 +99,8 @@ void app.whenReady().then(() => {
 app.on('window-all-closed', () => {
   log.info('all windows closed, quitting')
   app.quit()
+})
+
+app.on('will-quit', () => {
+  stopServer()
 })
