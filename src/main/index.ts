@@ -56,6 +56,15 @@ function createWindow(): void {
   })
 
   win.once('ready-to-show', () => {
+    // ponytail: `ready-to-show` is the closest proxy for first paint that does
+    // not need renderer instrumentation — the frame is composited and the
+    // window is one `show()` away. scripts/bench.ts parses this line.
+    if (process.env.HARNESS_BENCH) {
+      process.stdout.write(`harness:bench first-paint ${Date.now()}\n`)
+      app.quit()
+      return
+    }
+
     if (process.platform === 'darwin') {
       win.setWindowButtonVisibility(true)
       win.setWindowButtonPosition({ x: 16, y: 20 })

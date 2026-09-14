@@ -1,0 +1,17 @@
+{
+  "commit": "b97ab4d1ddf409fbeaafec04258fa8b2e2fde690",
+  "updatedAt": "2026-09-14T05:48:08.590Z",
+  "results": [
+    {
+      "name": "cold-start",
+      "platform": "darwin",
+      "unit": "ms",
+      "budget": 800,
+      "samples": 5,
+      "p50": 204,
+      "p99": 211,
+      "min": 190,
+      "max": 211
+    }
+  ]
+}

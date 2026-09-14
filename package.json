@@ -15,6 +15,7 @@
     "typecheck": "bun run typecheck:node && bun run typecheck:web",
     "test": "vitest run",
     "test:watch": "vitest",
+    "bench": "bun scripts/bench.ts",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",

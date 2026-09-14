@@ -6,3 +6,4 @@ settings.json
 *.log
 .eslintcache
 coverage/
+bench/last-run.json
