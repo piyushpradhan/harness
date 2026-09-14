@@ -4,7 +4,11 @@ import { hasAuth, setAuth } from './services/auth'
 import { testConnection } from './services/llm'
 import { listProviders } from './services/providers'
 
+import { createLogger } from '@shared/logger'
+
 import type { WindowChromeState } from '@shared/window-chrome'
+
+const log = createLogger('ipc')
 
 function windowFrom(event: IpcMainInvokeEvent): BrowserWindow | null {
   return BrowserWindow.fromWebContents(event.sender)
@@ -23,10 +27,15 @@ export function readChromeState(win: BrowserWindow): WindowChromeState {
  * whether a provider is connected, never what its key is.
  */
 export function registerIpcHandlers(): void {
+  log.debug('registering IPC handlers')
+
   ipcMain.handle('providers:list', () => listProviders())
   ipcMain.handle('auth:set', (_event, providerId: string, key: string) => setAuth(providerId, key))
   ipcMain.handle('auth:has', (_event, providerId: string) => hasAuth(providerId))
-  ipcMain.handle('auth:test', (_event, providerId: string) => testConnection(providerId))
+  ipcMain.handle('auth:test', (_event, providerId: string) => {
+    log.info('testing provider connection', { provider: providerId })
+    return testConnection(providerId)
+  })
 
   ipcMain.handle('window:minimize', (event) => {
     windowFrom(event)?.minimize()

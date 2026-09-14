@@ -3,6 +3,10 @@ import path from 'node:path'
 
 import { app } from 'electron'
 
+import { createLogger } from '@shared/logger'
+
+const log = createLogger('auth')
+
 export interface AuthInfo {
   type: 'api'
   key: string
@@ -21,7 +25,7 @@ async function readAll(): Promise<AuthFile> {
   } catch (err) {
     // A missing file is the normal first-run state, not an error.
     if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
-      console.error('auth: failed to read auth.json', err)
+      log.error('failed to read auth.json', err)
     }
     return {}
   }
@@ -34,6 +38,7 @@ async function writeAll(data: AuthFile): Promise<void> {
   await fs.mkdir(path.dirname(file), { recursive: true })
   await fs.writeFile(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
   await fs.rename(tmp, file)
+  log.debug('wrote auth file', { file, providers: Object.keys(data) })
 }
 
 export async function getAuth(id: string): Promise<AuthInfo | undefined> {
@@ -48,6 +53,7 @@ export async function setAuth(id: string, key: string): Promise<void> {
   const trimmed = key.trim()
   if (!trimmed) throw new Error(`auth: refusing to store an empty key for '${id}'`)
   await writeAll({ ...(await readAll()), [id]: { type: 'api', key: trimmed } })
+  log.info('stored API key', { provider: id })
 }
 
 export async function clearAuth(id: string): Promise<void> {
@@ -55,4 +61,5 @@ export async function clearAuth(id: string): Promise<void> {
   if (!(id in all)) return
   delete all[id]
   await writeAll(all)
+  log.info('cleared API key', { provider: id })
 }

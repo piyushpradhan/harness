@@ -2,7 +2,11 @@ import { join } from 'node:path'
 
 import { BrowserWindow, app } from 'electron'
 
+import { createLogger } from '@shared/logger'
+
 import { readChromeState, registerIpcHandlers } from './ipc'
+
+const log = createLogger('main')
 
 function sendChromeState(win: BrowserWindow): void {
   if (win.isDestroyed()) return
@@ -47,6 +51,10 @@ function createWindow(): void {
   win.on('unmaximize', onChromeChange)
   win.on('enter-full-screen', onChromeChange)
   win.on('leave-full-screen', onChromeChange)
+  win.webContents.on('render-process-gone', (_event, details) => {
+    log.error('renderer process gone', details)
+  })
+
   win.once('ready-to-show', () => {
     if (process.platform === 'darwin') {
       win.setWindowButtonVisibility(true)
@@ -65,6 +73,11 @@ function createWindow(): void {
 }
 
 void app.whenReady().then(() => {
+  log.info('app ready', {
+    electron: process.versions.electron,
+    node: process.versions.node,
+    platform: process.platform,
+  })
   registerIpcHandlers()
   createWindow()
 
@@ -74,5 +87,6 @@ void app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => {
+  log.info('all windows closed, quitting')
   app.quit()
 })

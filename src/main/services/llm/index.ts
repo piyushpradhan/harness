@@ -1,4 +1,8 @@
+import { createLogger } from '@shared/logger'
+
 import { getCredentials } from '../providers'
+
+const log = createLogger('llm')
 
 /** Cheapest model id accepted by every provider in the catalog; used for reachability checks. */
 const PING_MODEL = 'models'
@@ -13,6 +17,8 @@ export async function chat(providerId: string, model: string, userText: string):
     body: JSON.stringify({ model, messages: [{ role: 'user', content: userText }] }),
   })
 
+  log.debug('chat completed', { provider: providerId, model, status: res.status })
+
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
   const result = (await res.json()) as { choices: { message: { content: string } }[] }
   return result.choices[0].message.content
@@ -24,7 +30,7 @@ export async function testConnection(providerId: string): Promise<boolean> {
     await chat(providerId, PING_MODEL, 'ping')
     return true
   } catch (err) {
-    console.error(`llm: connection test failed for '${providerId}'`, err)
+    log.warn('connection test failed', { provider: providerId }, err)
     return false
   }
 }

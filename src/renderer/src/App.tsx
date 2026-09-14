@@ -1,5 +1,7 @@
 import { useState, type FormEvent, type KeyboardEvent } from 'react'
 
+import { createLogger } from '@shared/logger'
+
 import { TitleBar } from '@/components/title-bar'
 import { Button } from '@/components/ui/button'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
@@ -15,6 +17,8 @@ import {
 } from '@/components/ui/message-scroller'
 import { Textarea } from '@/components/ui/textarea'
 
+const log = createLogger('app')
+
 interface Entry {
   id: number
   text: string
@@ -27,12 +31,12 @@ export default function App() {
   function handleSubmit(e: FormEvent<HTMLFormElement>): void {
     e.preventDefault()
     const value = text.trim()
-    console.log('value: ', value)
-
     if (!value) return
 
     if (value === '/connect') {
-      void window.harness.auth.test('opencode-go')
+      void window.harness.auth.test('opencode-go').then((ok) => {
+        log.info('provider connection test', { provider: 'opencode-go', ok })
+      })
     } else {
       setEntries((prev) => [...prev, { id: Date.now(), text: value }])
       setText('')
