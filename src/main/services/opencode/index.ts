@@ -35,7 +35,14 @@ interface ServerInfo {
 /** Minimal shape of the events observed on the V2 event bus. */
 interface RawEvent {
   type?: string
-  data?: { sessionID?: string; delta?: string; finish?: string }
+  data?: {
+    sessionID?: string
+    delta?: string
+    finish?: string
+    id?: string
+    action?: string
+    resources?: string[]
+  }
 }
 
 let child: ChildProcess | null = null
@@ -72,6 +79,16 @@ async function isHealthy(info: ServerInfo): Promise<boolean> {
 export async function ensureServer(): Promise<ServerInfo> {
   if (server) return server
 
+  // Point the service at an already-running server instead of spawning one.
+  // scripts/bench.ts uses this to substitute a deterministic fake; it is also
+  // the hook for attaching to an `opencode serve` you started yourself.
+  const external = process.env.HARNESS_OPENCODE_URL
+  if (external) {
+    server = { url: external, password: process.env.HARNESS_OPENCODE_PASSWORD ?? '' }
+    log.info('using external opencode server', { url: external })
+    return server
+  }
+
   const password = randomBytes(24).toString('base64url')
   for (let attempt = 0; attempt < PORT_ATTEMPTS; attempt++) {
     const port = BASE_PORT + attempt
@@ -105,7 +122,8 @@ async function ensureSession(info: ServerInfo): Promise<string> {
     headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
     body: JSON.stringify({ location: { directory: process.cwd() } }),
   })
-  if (!res.ok) throw new Error(`create session: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
+  if (!res.ok)
+    throw new Error(`create session: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
   const result = (await res.json()) as { data: { id: string } }
   sessionID = result.data.id
   log.info('created session', { sessionID })
@@ -144,6 +162,12 @@ function mapEvent(event: RawEvent, emit: (evt: OpencodeStreamEvent) => void): vo
     case 'session.reasoning.delta':
       emit({ type: 'thinking', text: event.data?.delta ?? '' })
       break
+    case 'session.tool.called':
+      emit({ type: 'tool', state: 'running' })
+      break
+    case 'session.tool.success':
+      emit({ type: 'tool', state: 'completed' })
+      break
     case 'session.step.ended':
       emit({ type: 'step', finishReason: event.data?.finish ?? 'stop' })
       break
@@ -156,11 +180,37 @@ function mapEvent(event: RawEvent, emit: (evt: OpencodeStreamEvent) => void): vo
   }
 }
 
+/**
+ * A permission request nobody answers stalls the agent loop forever — that
+ * is what "thinking stops, no final text" looks like on the wire. The
+ * harness auto-approves each request once and reports it in the UI.
+ */
+async function approvePermission(
+  info: ServerInfo,
+  sessionID: string,
+  requestID: string,
+): Promise<void> {
+  try {
+    const res = await fetch(`${info.url}/api/session/${sessionID}/permission/${requestID}/reply`, {
+      method: 'POST',
+      headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ reply: 'once' }),
+    })
+    if (!res.ok) log.warn('permission reply rejected', { status: res.status })
+    else log.info('permission auto-approved', { sessionID })
+  } catch (err) {
+    log.warn('permission reply failed', err)
+  }
+}
+
 async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
   const decoder = new SseDecoder()
   while (!signal.aborted) {
     try {
-      const res = await fetch(`${info.url}/api/event`, { headers: authHeaders(info.password), signal })
+      const res = await fetch(`${info.url}/api/event`, {
+        headers: authHeaders(info.password),
+        signal,
+      })
       if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
 
       const reader = res.body.getReader()
@@ -168,7 +218,13 @@ async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
         const read = (await reader.read()) as { done: boolean; value?: Uint8Array }
         if (read.done || !read.value) break
         for (const raw of decoder.push(read.value)) {
-          mapEvent(raw as RawEvent, (evt) => streamSink?.(evt))
+          const evt = raw as RawEvent
+          if (evt.type === 'permission.asked' && evt.data?.sessionID === activeSessionID && evt.data.id) {
+            const detail = `${evt.data.action ?? 'permission'} ${(evt.data.resources ?? []).join(', ')}`
+            streamSink?.({ type: 'tool', state: 'running', detail })
+            void approvePermission(info, evt.data.sessionID, evt.data.id)
+          }
+          mapEvent(evt, (mapped) => streamSink?.(mapped))
         }
       }
     } catch (err) {

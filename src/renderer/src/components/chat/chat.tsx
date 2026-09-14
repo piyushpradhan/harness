@@ -1,7 +1,9 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 
 import { createLogger } from '@shared/logger'
 import type { OpencodeStreamEvent } from '@shared/opencode-stream'
+
+import * as bench from '@/lib/bench-probe'
 
 import { Marker, MarkerContent } from '@/components/ui/marker'
 import {
@@ -26,6 +28,8 @@ function applyStreamEvent(message: ChatMessage, event: OpencodeStreamEvent): Cha
       return { ...message, content: message.content + event.text }
     case 'thinking':
       return { ...message, reasoning: (message.reasoning ?? '') + event.text }
+    case 'tool':
+      return { ...message, tool: { state: event.state, detail: event.detail } }
     case 'done':
       return { ...message, streaming: false }
     case 'error':
@@ -50,6 +54,7 @@ export function Chat() {
   // single in-flight assistant message tracked by the ref.
   useEffect(() => {
     return window.harness.opencode.onStream((event) => {
+      bench.onStreamEvent(event)
       setMessages((prev) =>
         prev.map((message) =>
           message.id === assistantIdRef.current ? applyStreamEvent(message, event) : message,
@@ -57,6 +62,12 @@ export function Chat() {
       )
     })
   }, [])
+
+  // The transcript has hit the DOM but is not painted yet — the point the
+  // streaming benchmark measures to. Inert outside `?bench=stream`.
+  useLayoutEffect(() => {
+    bench.afterCommit()
+  }, [messages])
 
   const handleSubmit = useCallback((text: string): boolean => {
     if (text === '/connect') {
@@ -87,6 +98,10 @@ export function Chat() {
     })
     return true
   }, [])
+
+  useEffect(() => {
+    bench.autoSubmit(handleSubmit)
+  }, [handleSubmit])
 
   return (
     <div className="app-no-drag absolute inset-0 flex min-h-0 flex-col">

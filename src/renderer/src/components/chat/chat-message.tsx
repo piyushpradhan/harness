@@ -28,6 +28,12 @@ export const ChatMessageItem = memo(function ChatMessageItem({ message }: ChatMe
                   {message.reasoning}
                 </div>
               ) : null}
+              {message.tool ? (
+                <div className="mb-2 text-xs text-muted-foreground/80 italic">
+                  {message.tool.state === 'running' ? '⏳' : '✓'}{' '}
+                  {message.tool.detail ?? 'running a tool'}
+                </div>
+              ) : null}
               {message.content || (message.streaming ? '…' : '')}
             </BubbleContent>
           </Bubble>

@@ -7,6 +7,7 @@
 export type OpencodeStreamEvent =
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
+  | { type: 'tool'; state: 'running' | 'completed'; detail?: string }
   | { type: 'step'; finishReason: string }
   | { type: 'done' }
   | { type: 'error'; message: string }
