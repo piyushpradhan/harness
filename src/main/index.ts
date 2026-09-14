@@ -1,23 +1,8 @@
 import { join } from 'node:path'
 
-import { BrowserWindow, app, ipcMain, type IpcMainInvokeEvent } from 'electron'
-import { setAuth, getAuth } from './services/auth'
-import { listProviders } from './services/providers'
-import { chat } from './services/llm'
+import { BrowserWindow, app } from 'electron'
 
-import type { WindowChromeState } from '@shared/window-chrome'
-
-function windowFrom(event: IpcMainInvokeEvent): BrowserWindow | null {
-  return BrowserWindow.fromWebContents(event.sender)
-}
-
-function readChromeState(win: BrowserWindow): WindowChromeState {
-  return {
-    focused: win.isFocused(),
-    maximized: win.isMaximized(),
-    fullScreen: win.isFullScreen(),
-  }
-}
+import { readChromeState, registerIpcHandlers } from './ipc'
 
 function sendChromeState(win: BrowserWindow): void {
   if (win.isDestroyed()) return
@@ -55,7 +40,7 @@ function createWindow(): void {
     },
   })
 
-  const onChromeChange = () => sendChromeState(win)
+  const onChromeChange = (): void => sendChromeState(win)
   win.on('focus', onChromeChange)
   win.on('blur', onChromeChange)
   win.on('maximize', onChromeChange)
@@ -80,6 +65,7 @@ function createWindow(): void {
 }
 
 void app.whenReady().then(() => {
+  registerIpcHandlers()
   createWindow()
 
   app.on('activate', () => {
@@ -89,40 +75,4 @@ void app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   app.quit()
-})
-
-ipcMain.handle('auth:set', (_e, providerID: string, key: string) => setAuth(providerID, key.trim()))
-ipcMain.handle('auth:get', (_e, providerID: string) => getAuth(providerID))
-ipcMain.handle('providers:list', () => listProviders())
-ipcMain.handle('auth:test', async (_e, providerID: string) => {
-  // verify key actually works
-  try {
-    await chat(providerID, 'models', 'ping')
-    return true
-  } catch {
-    return false
-  }
-})
-
-ipcMain.handle('window:minimize', (event) => {
-  windowFrom(event)?.minimize()
-})
-ipcMain.handle('window:close', (event) => {
-  windowFrom(event)?.close()
-})
-ipcMain.handle('window:zoom', (event) => {
-  const win = windowFrom(event)
-  if (!win) return
-  if (win.isMaximized()) win.unmaximize()
-  else win.maximize()
-})
-ipcMain.handle('window:toggleFullScreen', (event) => {
-  const win = windowFrom(event)
-  if (!win) return
-  void win.setFullScreen(!win.isFullScreen())
-})
-ipcMain.handle('window:getState', (event): WindowChromeState => {
-  const win = windowFrom(event)
-  if (!win) return { focused: false, maximized: false, fullScreen: false }
-  return readChromeState(win)
 })

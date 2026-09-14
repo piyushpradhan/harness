@@ -27,12 +27,16 @@ const api = {
   },
 } as const
 
-contextBridge.exposeInMainWorld('harness', {
-  providers: { list: () => ipcRenderer.invoke('providers:list') },
-  auth: {
-    set: (id: string, key: string) => ipcRenderer.invoke('auth:set', id, key),
-    has: (id: string) => ipcRenderer.invoke('auth:has', id),
-    test: (id: string) => ipcRenderer.invoke('auth:test', id),
+const harness = {
+  providers: {
+    list: () => ipcRenderer.invoke('providers:list') as Promise<{ id: string; name: string }[]>,
   },
-})
+  auth: {
+    set: (id: string, key: string) => ipcRenderer.invoke('auth:set', id, key) as Promise<void>,
+    has: (id: string) => ipcRenderer.invoke('auth:has', id) as Promise<boolean>,
+    test: (id: string) => ipcRenderer.invoke('auth:test', id) as Promise<boolean>,
+  },
+} as const
+
 contextBridge.exposeInMainWorld('api', api)
+contextBridge.exposeInMainWorld('harness', harness)
