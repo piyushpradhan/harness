@@ -4,7 +4,11 @@ import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 
 interface ChatComposerProps {
-  onSubmit: (value: string) => void
+  /**
+   * Called with the trimmed draft. Return true when the draft was consumed
+   * and the composer should clear it, false to keep it in place.
+   */
+  onSubmit: (value: string) => boolean
 }
 
 /**
@@ -19,8 +23,7 @@ export const ChatComposer = memo(function ChatComposer({ onSubmit }: ChatCompose
       event.preventDefault()
       const text = value.trim()
       if (!text) return
-      onSubmit(text)
-      setValue('')
+      if (onSubmit(text)) setValue('')
     },
     [onSubmit, value],
   )

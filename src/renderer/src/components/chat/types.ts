@@ -1,7 +1,4 @@
-export type ChatRole = 'user' | 'assistant'
-
 export interface ChatMessage {
-  id: string
-  role: ChatRole
+  id: number
   content: string
 }

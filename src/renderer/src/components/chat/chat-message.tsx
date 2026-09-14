@@ -16,13 +16,11 @@ interface ChatMessageItemProps {
  * and never triggers row re-renders.
  */
 export const ChatMessageItem = memo(function ChatMessageItem({ message }: ChatMessageItemProps) {
-  const isUser = message.role === 'user'
-
   return (
-    <MessageScrollerItem messageId={message.id} scrollAnchor={isUser}>
-      <Message align={isUser ? 'end' : 'start'}>
+    <MessageScrollerItem messageId={String(message.id)} scrollAnchor>
+      <Message align="end">
         <MessageContent>
-          <Bubble variant={isUser ? 'default' : 'muted'} align={isUser ? 'end' : 'start'}>
+          <Bubble variant="default" align="end">
             <BubbleContent>{message.content}</BubbleContent>
           </Bubble>
         </MessageContent>
