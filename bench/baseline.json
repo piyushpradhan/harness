@@ -1,6 +1,6 @@
 {
-  "commit": "b97ab4d1ddf409fbeaafec04258fa8b2e2fde690",
-  "updatedAt": "2026-09-14T05:48:08.590Z",
+  "commit": "d9a818054ca4940cc3ca58095885eee9716dc2ed",
+  "updatedAt": "2026-09-14T13:01:40.846Z",
   "results": [
     {
       "name": "cold-start",
@@ -12,6 +12,39 @@
       "p99": 211,
       "min": 190,
       "max": 211
+    },
+    {
+      "name": "delta-to-paint",
+      "platform": "darwin",
+      "unit": "ms",
+      "budget": 32,
+      "samples": 10000,
+      "p50": 10.100000023841858,
+      "p99": 17.099999964237213,
+      "min": 0.2999999523162842,
+      "max": 18.399999976158142
+    },
+    {
+      "name": "dropped-frames",
+      "platform": "darwin",
+      "unit": "",
+      "budget": 0,
+      "samples": 5,
+      "p50": 0,
+      "p99": 0,
+      "min": 0,
+      "max": 0
+    },
+    {
+      "name": "stream-rss",
+      "platform": "darwin",
+      "unit": "MB",
+      "budget": 400,
+      "samples": 5,
+      "p50": 192.1875,
+      "p99": 194.453125,
+      "min": 187.078125,
+      "max": 194.453125
     }
   ]
 }

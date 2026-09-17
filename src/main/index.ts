@@ -9,6 +9,9 @@ import { stopServer } from './services/opencode'
 
 const log = createLogger('main')
 
+/** `stream` runs the streaming benchmark; any other value means cold-start. */
+const BENCH_MODE = process.env.HARNESS_BENCH
+
 function sendChromeState(win: BrowserWindow): void {
   if (win.isDestroyed()) return
   win.webContents.send('window:state', readChromeState(win))
@@ -56,11 +59,13 @@ function createWindow(): void {
     log.error('renderer process gone', details)
   })
 
+  if (BENCH_MODE === 'stream') attachStreamBench(win)
+
   win.once('ready-to-show', () => {
     // ponytail: `ready-to-show` is the closest proxy for first paint that does
     // not need renderer instrumentation — the frame is composited and the
     // window is one `show()` away. scripts/bench.ts parses this line.
-    if (process.env.HARNESS_BENCH) {
+    if (BENCH_MODE && BENCH_MODE !== 'stream') {
       process.stdout.write(`harness:bench first-paint ${Date.now()}\n`)
       app.quit()
       return
@@ -73,13 +78,38 @@ function createWindow(): void {
     win.show()
   })
 
+  // The streaming benchmark needs a window that actually composites frames, so
+  // it renders normally and reports from the renderer instead.
+  const search = BENCH_MODE === 'stream' ? '?bench=stream' : ''
+
   // Dev: electron-vite serves the renderer from its dev server (with HMR).
   // Prod: load the built file from out/renderer.
   if (process.env.ELECTRON_RENDERER_URL) {
-    void win.loadURL(process.env.ELECTRON_RENDERER_URL)
+    void win.loadURL(`${process.env.ELECTRON_RENDERER_URL}${search}`)
   } else {
-    void win.loadFile(join(__dirname, '../renderer/index.html'))
+    void win.loadFile(join(__dirname, '../renderer/index.html'), { search })
   }
+}
+
+/**
+ * Forward the renderer's `harness:bench` line to stdout, where scripts/bench.ts
+ * reads it, and stamp it with the renderer's resident set size — which only the
+ * main process can see, since the renderer is sandboxed and has no `process`.
+ */
+function attachStreamBench(win: BrowserWindow): void {
+  win.webContents.on('console-message', (details) => {
+    if (!details.message.startsWith('harness:bench stream ')) return
+    const report = JSON.parse(details.message.slice('harness:bench stream '.length)) as Record<
+      string,
+      unknown
+    >
+    const pid = win.webContents.getOSProcessId()
+    const metrics = app.getAppMetrics().find((entry) => entry.pid === pid)
+    // `workingSetSize` is reported in kilobytes.
+    report.rssMb = metrics ? metrics.memory.workingSetSize / 1024 : 0
+    process.stdout.write(`harness:bench stream ${JSON.stringify(report)}\n`)
+    app.quit()
+  })
 }
 
 void app.whenReady().then(() => {

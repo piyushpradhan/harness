@@ -6,11 +6,12 @@
  *   bun run bench --save       # ...and rewrite bench/baseline.json
  *
  * Flags: --iterations=N --tolerance=0.25 --filter=<substring> --json=<path>
+ *        --deltas=N --rate=N   (streaming benchmarks only)
  *
- * ponytail: the only benchmark today is cold start to first paint, because it
- * is the only hot path that exists. Register delta→paint latency and dropped
- * frames here once the rAF event sink from Phase 0 of docs/PLAN.md lands — the
- * runner, the baseline format and the CI gate do not change.
+ * Two workloads: `cold-start` launches the app and waits for first paint;
+ * the streaming trio (`delta-to-paint`, `dropped-frames`, `stream-rss`) drives
+ * a fixed-rate delta stream from a fake OpenCode server through the real
+ * transport and reads the renderer's own measurements back over stdout.
  */
 import { execFileSync, spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
@@ -19,6 +20,8 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { percentile } from '@shared/lib/percentile'
+
+import { startFakeOpencode } from './fake-opencode'
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const BASELINE_PATH = path.join(ROOT, 'bench', 'baseline.json')
@@ -155,6 +158,8 @@ function fmt(value: number): string {
 }
 
 function pct(delta: number): string {
+  // A baseline of 0 (the dropped-frames target) makes the ratio undefined.
+  if (!Number.isFinite(delta)) return 'n/a'
   return `${delta >= 0 ? '+' : ''}${(delta * 100).toFixed(1)}%`
 }
 
@@ -195,7 +200,7 @@ async function launchOnce(): Promise<number> {
 
   return new Promise<number>((resolve, reject) => {
     const child = spawn(electronPath, [ROOT], {
-      env: { ...env, HARNESS_BENCH: '1', HARNESS_LOG: 'silent' },
+      env: { ...env, HARNESS_BENCH: 'first-paint', HARNESS_LOG: 'silent' },
       stdio: ['ignore', 'pipe', 'inherit'],
     })
 
@@ -209,7 +214,7 @@ async function launchOnce(): Promise<number> {
     child.stdout.setEncoding('utf-8')
     child.stdout.on('data', (chunk: string) => {
       buffer += chunk
-      const match = /harness:bench first-paint (\d+)/.exec(buffer)
+      const match = /harness:bench first-paint (\d+)\n/.exec(buffer)
       if (match && firstPaint === null) firstPaint = Number(match[1]) - startedAt
     })
 
@@ -222,7 +227,150 @@ async function launchOnce(): Promise<number> {
   })
 }
 
-export const BENCHMARKS: Benchmark[] = [coldStart]
+/**
+ * Streaming: one launch drives `deltas` text deltas at `rate`/s through the real
+ * transport — fake server → SSE decode → IPC → React → DOM — and the renderer
+ * reports per-delta latency, frame pacing and RSS back over stdout.
+ *
+ * All three benchmarks below read from the *same* launches, because running the
+ * app three times to collect three series from one workload would only add
+ * noise and minutes. `streamRuns` memoizes per iteration count.
+ */
+export interface StreamRun {
+  latencies: number[]
+  deltas: number
+  droppedFrames: number
+  framePeriod: number
+  durationMs: number
+  rssMb: number
+}
+
+const DEFAULT_DELTAS = 2_000
+const DEFAULT_RATE = 200
+
+let streamRunsCache: { key: string; runs: Promise<StreamRun[]> } | null = null
+
+function streamRuns(iterations: number): Promise<StreamRun[]> {
+  const deltas = Number(flag('deltas') ?? DEFAULT_DELTAS)
+  const rate = Number(flag('rate') ?? DEFAULT_RATE)
+  const key = `${iterations}/${deltas}/${rate}`
+  if (streamRunsCache?.key !== key) {
+    streamRunsCache = { key, runs: collectStreamRuns(iterations, deltas, rate) }
+  }
+  return streamRunsCache.runs
+}
+
+async function collectStreamRuns(
+  iterations: number,
+  deltas: number,
+  rate: number,
+): Promise<StreamRun[]> {
+  const electron = path.join(ROOT, 'node_modules', 'electron', 'dist')
+  const built = path.join(ROOT, 'out', 'main', 'index.js')
+  if (!existsSync(electron) || !existsSync(built)) {
+    console.warn('stream: skipped — run `bun install` and `bun run build` first')
+    return []
+  }
+
+  const runs: StreamRun[] = []
+  for (let i = 0; i < iterations; i++) {
+    const server = await startFakeOpencode({ deltas, rate })
+    try {
+      runs.push(await streamOnce(server.url, deltas, rate))
+    } finally {
+      await server.close()
+    }
+  }
+
+  // Node's timer floor means the server cannot always hit the requested rate.
+  // Reporting what it actually achieved stops a run being read as evidence for
+  // a load it never applied.
+  const achieved = runs.map((run) => Math.round((run.deltas / run.durationMs) * 1000))
+  console.log(
+    `stream: ${deltas} deltas at ${rate}/s requested, ${achieved.join('/')} achieved, ` +
+      `frame period ${runs[0]?.framePeriod.toFixed(1) ?? '?'}ms`,
+  )
+  return runs
+}
+
+async function streamOnce(serverUrl: string, deltas: number, rate: number): Promise<StreamRun> {
+  const { default: electronPath } = (await import('electron')) as unknown as { default: string }
+  const { ELECTRON_RUN_AS_NODE: _asNode, ...env } = process.env
+  // Emission time plus a generous margin for launch and teardown.
+  const timeoutMs = (deltas / rate) * 1000 + 60_000
+
+  return new Promise<StreamRun>((resolve, reject) => {
+    const child = spawn(electronPath, [ROOT], {
+      env: {
+        ...env,
+        HARNESS_BENCH: 'stream',
+        HARNESS_LOG: 'silent',
+        HARNESS_OPENCODE_URL: serverUrl,
+      },
+      stdio: ['ignore', 'pipe', 'inherit'],
+    })
+
+    let report: StreamRun | null = null
+    let buffer = ''
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL')
+      reject(new Error(`stream: timed out after ${Math.round(timeoutMs / 1000)}s`))
+    }, timeoutMs)
+
+    child.stdout.setEncoding('utf-8')
+    child.stdout.on('data', (chunk: string) => {
+      buffer += chunk
+      // The trailing newline is what proves the line is complete: the report is
+      // tens of kilobytes and arrives split across several stdout chunks.
+      const match = /harness:bench stream (.+)\n/.exec(buffer)
+      if (!match || report !== null) return
+      try {
+        report = JSON.parse(match[1]) as StreamRun
+      } catch (err) {
+        child.kill('SIGKILL')
+        reject(new Error(`stream: malformed report: ${String(err)}`))
+      }
+    })
+
+    child.on('error', reject)
+    child.on('exit', () => {
+      clearTimeout(timer)
+      if (report === null) reject(new Error('stream: app exited before reporting'))
+      else if (report.deltas < deltas) {
+        reject(new Error(`stream: received ${report.deltas} of ${deltas} deltas`))
+      } else resolve(report)
+    })
+  })
+}
+
+const deltaToPaint: Benchmark = {
+  name: 'delta-to-paint',
+  unit: 'ms',
+  budget: 32,
+  async run(iterations) {
+    return (await streamRuns(iterations)).flatMap((run) => run.latencies)
+  },
+}
+
+const droppedFrames: Benchmark = {
+  name: 'dropped-frames',
+  unit: '',
+  budget: 0,
+  async run(iterations) {
+    return (await streamRuns(iterations)).map((run) => run.droppedFrames)
+  },
+}
+
+const streamRss: Benchmark = {
+  name: 'stream-rss',
+  unit: 'MB',
+  budget: 400,
+  async run(iterations) {
+    return (await streamRuns(iterations)).map((run) => run.rssMb)
+  },
+}
+
+export const BENCHMARKS: Benchmark[] = [coldStart, deltaToPaint, droppedFrames, streamRss]
 
 function flag(name: string): string | undefined {
   const prefix = `--${name}=`
