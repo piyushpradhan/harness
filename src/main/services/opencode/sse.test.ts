@@ -17,7 +17,9 @@ describe('SseDecoder', () => {
     const decoder = new SseDecoder()
     const first = decoder.push(chunk('data: {"type":"session.text.del'))
     expect(first).toEqual([])
-    const second = decoder.push(chunk('ta","delta":"hi"}\n\ndata: {"type":"session.step.ended"}\n\n'))
+    const second = decoder.push(
+      chunk('ta","delta":"hi"}\n\ndata: {"type":"session.step.ended"}\n\n'),
+    )
     expect(second).toEqual([
       { type: 'session.text.delta', delta: 'hi' },
       { type: 'session.step.ended' },
@@ -26,9 +28,7 @@ describe('SseDecoder', () => {
 
   it('ignores comments and non-data fields', () => {
     const decoder = new SseDecoder()
-    const events = decoder.push(
-      chunk(': heartbeat\n\nevent: message\ndata: {"ok":true}\n\n\n\n'),
-    )
+    const events = decoder.push(chunk(': heartbeat\n\nevent: message\ndata: {"ok":true}\n\n\n\n'))
     expect(events).toEqual([{ ok: true }])
   })
 
