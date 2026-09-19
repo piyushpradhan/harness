@@ -27,3 +27,19 @@ export function applyStreamEvent(message: ChatMessage, event: OpencodeStreamEven
 export function applyBatch(message: ChatMessage, batch: OpencodeStreamBatch): ChatMessage {
   return batch.reduce(applyStreamEvent, message)
 }
+
+/**
+ * Apply one batch to the transcript, targeting the in-flight assistant
+ * message. Non-target rows keep their reference identity so the per-row memo
+ * skips them — only the streamed row re-renders per frame.
+ */
+export function applyBatchToMessages(
+  messages: ChatMessage[],
+  targetId: string | null,
+  batch: OpencodeStreamBatch,
+): ChatMessage[] {
+  if (targetId === null) return messages
+  return messages.map((message) =>
+    message.id === targetId ? applyBatch(message, batch) : message,
+  )
+}

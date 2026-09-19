@@ -17,7 +17,7 @@ import {
 
 import { ChatComposer } from './chat-composer'
 import { ChatMessageItem } from './chat-message'
-import { applyBatch } from './stream-reducer'
+import { applyBatchToMessages } from './stream-reducer'
 import type { ChatMessage } from './types'
 
 const log = createLogger('app')
@@ -45,18 +45,20 @@ export function Chat() {
       if (queueRef.current.length === 0) return
       const batch = queueRef.current
       queueRef.current = []
-      setMessages((prev) =>
-        prev.map((message) =>
-          message.id === assistantIdRef.current ? applyBatch(message, batch) : message,
-        ),
-      )
+      setMessages((prev) => applyBatchToMessages(prev, assistantIdRef.current, batch))
     }
 
-    return window.harness.opencode.onStream((batch) => {
+    const unsubscribe = window.harness.opencode.onStream((batch) => {
       for (const event of batch) bench.onStreamEvent(event)
       queueRef.current.push(...batch)
       rafRef.current ??= requestAnimationFrame(drain)
     })
+
+    return () => {
+      unsubscribe()
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current)
+      rafRef.current = null
+    }
   }, [])
 
   // The transcript has hit the DOM but is not painted yet — the point the
