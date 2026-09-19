@@ -17,27 +17,10 @@ import {
 
 import { ChatComposer } from './chat-composer'
 import { ChatMessageItem } from './chat-message'
+import { applyBatch } from './stream-reducer'
 import type { ChatMessage } from './types'
 
 const log = createLogger('app')
-
-/** Update the in-flight assistant message for the given stream event. */
-function applyStreamEvent(message: ChatMessage, event: OpencodeStreamEvent): ChatMessage {
-  switch (event.type) {
-    case 'text':
-      return { ...message, content: message.content + event.text }
-    case 'thinking':
-      return { ...message, reasoning: (message.reasoning ?? '') + event.text }
-    case 'tool':
-      return { ...message, tool: { state: event.state, detail: event.detail } }
-    case 'done':
-      return { ...message, streaming: false }
-    case 'error':
-      return { ...message, streaming: false, content: message.content + `\n\n[${event.message}]` }
-    case 'step':
-      return message
-  }
-}
 
 /**
  * The chat screen: transcript scroller + composer.
@@ -50,16 +33,29 @@ export function Chat() {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const assistantIdRef = useRef<string | null>(null)
 
-  // One subscription for the lifetime of the chat; events arrive for the
-  // single in-flight assistant message tracked by the ref.
+  // Inbound batches queue into a plain array; a single requestAnimationFrame
+  // drains the queue and performs one setMessages per frame. React commits are
+  // therefore capped at the refresh rate and independent of token rate.
+  const queueRef = useRef<OpencodeStreamEvent[]>([])
+  const rafRef = useRef<number | null>(null)
+
   useEffect(() => {
-    return window.harness.opencode.onStream((event) => {
-      bench.onStreamEvent(event)
+    const drain = () => {
+      rafRef.current = null
+      if (queueRef.current.length === 0) return
+      const batch = queueRef.current
+      queueRef.current = []
       setMessages((prev) =>
         prev.map((message) =>
-          message.id === assistantIdRef.current ? applyStreamEvent(message, event) : message,
+          message.id === assistantIdRef.current ? applyBatch(message, batch) : message,
         ),
       )
+    }
+
+    return window.harness.opencode.onStream((batch) => {
+      for (const event of batch) bench.onStreamEvent(event)
+      queueRef.current.push(...batch)
+      rafRef.current ??= requestAnimationFrame(drain)
     })
   }, [])
 

@@ -39,11 +39,11 @@ export function registerIpcHandlers(): void {
   })
 
   // Streaming channel to OpenCode. The window that sent the message receives
-  // the stream events; the bus itself is global and filtered in the service.
+  // the stream batches; the bus itself is global and filtered in the service.
   let streamTarget: BrowserWindow | null = null
-  onStreamEvent((evt) => {
+  onStreamEvent((batch) => {
     if (streamTarget && !streamTarget.isDestroyed()) {
-      streamTarget.webContents.send('opencode:stream', evt)
+      streamTarget.webContents.send('opencode:stream', batch)
     }
   })
   ipcMain.handle('opencode:send', async (event, text: string) => {

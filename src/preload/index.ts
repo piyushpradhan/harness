@@ -1,6 +1,6 @@
 import { contextBridge, ipcRenderer } from 'electron'
 
-import type { OpencodeStreamEvent } from '@shared/opencode-stream'
+import type { OpencodeStreamBatch } from '@shared/opencode-stream'
 import type { WindowChromeState } from '@shared/window-chrome'
 
 const api = {
@@ -40,9 +40,9 @@ const harness = {
   opencode: {
     send: (text: string) =>
       ipcRenderer.invoke('opencode:send', text) as Promise<{ ok: boolean; error?: string }>,
-    onStream: (callback: (event: OpencodeStreamEvent) => void) => {
-      const listener = (_event: unknown, evt: OpencodeStreamEvent) => {
-        callback(evt)
+    onStream: (callback: (batch: OpencodeStreamBatch) => void) => {
+      const listener = (_event: unknown, batch: OpencodeStreamBatch) => {
+        callback(batch)
       }
       ipcRenderer.on('opencode:stream', listener)
       return () => {

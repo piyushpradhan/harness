@@ -2,8 +2,9 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { randomBytes } from 'node:crypto'
 
 import { createLogger } from '@shared/logger'
-import type { OpencodeStreamEvent } from '@shared/opencode-stream'
+import type { OpencodeStreamBatch, OpencodeStreamEvent } from '@shared/opencode-stream'
 
+import { createBatcher } from './batch'
 import { SseDecoder } from './sse'
 
 /**
@@ -50,6 +51,16 @@ let server: ServerInfo | null = null
 let sessionID: string | null = null
 let activeSessionID: string | null = null
 let streamAbort: AbortController | null = null
+
+/** Sink for batches leaving the service; wired to the renderer by main. */
+let streamSink: ((batch: OpencodeStreamBatch) => void) | null = null
+
+/**
+ * Accumulate stream events on an 8 ms timer (or 64-event cap) and deliver them
+ * as one array — one IPC message, one structured clone — instead of one per
+ * token. The renderer then applies each batch in a single frame.
+ */
+const batcher = createBatcher((batch) => streamSink?.(batch))
 
 function authHeaders(password: string): Record<string, string> {
   const token = Buffer.from(`opencode:${password}`).toString('base64')
@@ -221,10 +232,10 @@ async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
           const evt = raw as RawEvent
           if (evt.type === 'permission.asked' && evt.data?.sessionID === activeSessionID && evt.data.id) {
             const detail = `${evt.data.action ?? 'permission'} ${(evt.data.resources ?? []).join(', ')}`
-            streamSink?.({ type: 'tool', state: 'running', detail })
+            batcher.push({ type: 'tool', state: 'running', detail })
             void approvePermission(info, evt.data.sessionID, evt.data.id)
           }
-          mapEvent(evt, (mapped) => streamSink?.(mapped))
+          mapEvent(evt, (mapped) => batcher.push(mapped))
         }
       }
     } catch (err) {
@@ -235,10 +246,7 @@ async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
   }
 }
 
-/** Sink for events leaving the service; wired to the renderer by main. */
-let streamSink: ((evt: OpencodeStreamEvent) => void) | null = null
-
-export function onStreamEvent(sink: (evt: OpencodeStreamEvent) => void): void {
+export function onStreamEvent(sink: (batch: OpencodeStreamBatch) => void): void {
   streamSink = sink
 }
 
@@ -252,5 +260,6 @@ export function stopServer(): void {
   sessionID = null
   activeSessionID = null
   streamSink = null
+  batcher.dispose()
   log.info('stopped')
 }
