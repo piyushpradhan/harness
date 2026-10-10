@@ -211,6 +211,32 @@ only; state is authoritative on `done`. If rows ever need rich content
 delta→paint comfortably under budget, #3 is complexity without a customer, and
 the honest engineering call is to skip it and record why.
 
+**Decision (f061e02): skipped.** #2 alone holds the budget. Measured on darwin
+(Apple silicon, 144 Hz display, so a 6.9 ms frame period and a 10.4 ms
+dropped-frame threshold), 2 000 deltas at an achieved ~164/s, 5 launches per
+run, machine otherwise idle:
+
+| Benchmark        | p50      | p99      | Budget |
+| ---------------- | -------- | -------- | ------ |
+| `delta-to-paint` | 11.6 ms  | 17.0 ms  | 32 ms  |
+| `dropped-frames` | 0        | 0        | 0      |
+| `stream-rss`     | 203.9 MB | 204.4 MB | 400 MB |
+
+At 5x load (6 000 deltas, ~790/s achieved) p99 was 16.3 ms with 0 dropped
+frames. Across 25 launches on an idle machine (20, ~164 and ~790 deltas/s),
+none dropped a frame. Two earlier launches each dropped a single frame, and
+both overlapped other Electron bench runs on the same machine. That is
+contention noise, not the transport. The p99 is about half the budget and the
+same as the pre-#2 baseline (17.1 ms), so this one frame of latency is not
+React's to win back.
+
+Two caveats should reopen this item if they ever matter. First, the
+benchmark still streams into a two-message transcript, so the 1 000-message
+target from #2 is unmeasured. Second, latency is stamped on renderer arrival,
+so it excludes the main-side batch wait (at most 8 ms). Even adding that wait
+in full, p99 stays under 32 ms. Add a transcript-length dimension to the rig
+before reconsidering #3.
+
 ---
 
 ### 4. Pre-warm the OpenCode server and open the event bus before prompting

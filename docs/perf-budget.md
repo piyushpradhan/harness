@@ -47,15 +47,16 @@ absolute budget is still enforced, so a first CI run publishes numbers without
 failing the build. Commit a `ci-darwin` baseline from the uploaded artifact once
 those numbers look stable, and drift gating starts there too.
 
-Current (darwin, Apple silicon, 5 iterations; `cold-start` after one discarded
-warm-up, streaming at 2 000 deltas/run and an achieved 178 deltas/s):
+Current (darwin, Apple silicon, 144 Hz display, 5 iterations; `cold-start`
+after one discarded warm-up, streaming at 2 000 deltas/run and an achieved
+164 deltas/s; recorded at f061e02, after delta coalescing, `HARDENING.md` #2):
 
 | Benchmark        | p50      | p99      | samples |
 | ---------------- | -------- | -------- | ------- |
-| `cold-start`     | 204 ms   | 211 ms   | 5       |
-| `delta-to-paint` | 10.1 ms  | 17.1 ms  | 10 000  |
+| `cold-start`     | 183 ms   | 185 ms   | 5       |
+| `delta-to-paint` | 11.6 ms  | 17.0 ms  | 10 000  |
 | `dropped-frames` | 0        | 0        | 5       |
-| `stream-rss`     | 192.2 MB | 194.5 MB | 5       |
+| `stream-rss`     | 203.9 MB | 204.4 MB | 5       |
 
 **Read this before optimizing the streaming path.** The transport meets its
 budget today: delta→paint p99 is one frame, and a probe at an achieved
