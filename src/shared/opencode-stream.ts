@@ -10,10 +10,18 @@
 
 export type OpencodeStreamBatch = OpencodeStreamEvent[]
 
-export type OpencodeStreamEvent =
+export type OpencodeStreamEvent = (
   | { type: 'text'; text: string }
   | { type: 'thinking'; text: string }
   | { type: 'tool'; state: 'running' | 'completed'; detail?: string }
   | { type: 'step'; finishReason: string }
   | { type: 'done' }
   | { type: 'error'; message: string }
+) & {
+  /**
+   * The `opencode:send` this event belongs to — route by this, not by "the
+   * latest message". Absent only for an error with no request in flight
+   * (the server dying between prompts).
+   */
+  requestId?: string
+}

@@ -46,15 +46,22 @@ export function registerIpcHandlers(): void {
       streamTarget.webContents.send('opencode:stream', batch)
     }
   })
-  ipcMain.handle('opencode:send', async (event, text: string) => {
+  // `requestId` is the renderer's id for the reply it is about to render; every
+  // stream event for this prompt comes back tagged with it. Omitted, main
+  // generates one and returns it.
+  ipcMain.handle('opencode:send', async (event, text: string, requestId?: unknown) => {
     const win = windowFrom(event)
     if (win) streamTarget = win
+    const callerId = typeof requestId === 'string' && requestId ? requestId : undefined
     try {
-      await sendMessage(String(text))
-      return { ok: true }
+      return { ok: true, requestId: await sendMessage(String(text), callerId) }
     } catch (err) {
       log.error('opencode send failed', err)
-      return { ok: false, error: err instanceof Error ? err.message : String(err) }
+      return {
+        ok: false,
+        requestId: callerId,
+        error: err instanceof Error ? err.message : String(err),
+      }
     }
   })
 

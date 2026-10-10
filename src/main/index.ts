@@ -5,7 +5,7 @@ import { BrowserWindow, app } from 'electron'
 import { createLogger } from '@shared/logger'
 
 import { readChromeState, registerIpcHandlers } from './ipc'
-import { stopServer } from './services/opencode'
+import { prewarm, stopServer } from './services/opencode'
 
 const log = createLogger('main')
 
@@ -76,6 +76,11 @@ function createWindow(): void {
       win.setWindowButtonPosition({ x: 16, y: 20 })
     }
     win.show()
+    // Boot OpenCode now so the first message finds it up. Not earlier: the
+    // spawn is a whole Bun runtime starting, and measured alongside renderer
+    // startup it cost cold-start up to ~80 ms p50. Nobody can type before the
+    // window is shown, so starting here hides the same boot for free.
+    prewarm()
   })
 
   // The streaming benchmark needs a window that actually composites frames, so
@@ -131,6 +136,19 @@ app.on('window-all-closed', () => {
   app.quit()
 })
 
-app.on('will-quit', () => {
-  stopServer()
+// `will-quit` cannot wait for anything, so the child could outlive the app as
+// an orphan holding port 4096. Defer the first quit until the server has
+// exited (bounded: SIGTERM, then SIGKILL), then quit for real.
+let shutdown: 'running' | 'stopping' | 'stopped' = 'running'
+app.on('before-quit', (event) => {
+  if (shutdown === 'stopped') return
+  event.preventDefault()
+  if (shutdown === 'stopping') return // a second Cmd+Q must not skip the wait
+  shutdown = 'stopping'
+  void stopServer()
+    .catch((err: unknown) => log.error('opencode shutdown failed', err))
+    .finally(() => {
+      shutdown = 'stopped'
+      app.quit()
+    })
 })

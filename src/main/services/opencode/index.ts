@@ -1,10 +1,12 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 
 import { createLogger } from '@shared/logger'
 import type { OpencodeStreamBatch, OpencodeStreamEvent } from '@shared/opencode-stream'
 
+import { exponentialDelay, fullJitterDelay } from './backoff'
 import { createBatcher } from './batch'
+import { LineTail, hasExited, isPortFree, terminate } from './process'
 import { SseDecoder } from './sse'
 
 /**
@@ -24,9 +26,19 @@ const log = createLogger('opencode')
 const BASE_PORT = 4096
 const PORT_ATTEMPTS = 4
 const HEALTH_TIMEOUT_MS = 2_000
-const HEALTH_POLL_MS = 250
-const HEALTH_POLLS = 60 // ~15s startup budget
-const RECONNECT_DELAY_MS = 1_000
+// Probe immediately, then poll 25 ms → 250 ms: a fast start is noticed within
+// a few ms, a slow one is not hammered. 15 s total before giving up.
+const HEALTH_POLL_BASE_MS = 25
+const HEALTH_POLL_MAX_MS = 250
+const STARTUP_BUDGET_MS = 15_000
+/** SIGTERM grace before SIGKILL, on stop and on a failed start. */
+const KILL_GRACE_MS = 2_000
+const STDERR_LINES = 20
+// Event-stream reconnects: full-jitter exponential backoff, 1 s → 30 s.
+// Ten consecutive failures (~1.5 min expected) is a server that is gone.
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+const RECONNECT_ATTEMPTS = 10
 
 interface ServerInfo {
   url: string
@@ -47,10 +59,27 @@ interface RawEvent {
 }
 
 let child: ChildProcess | null = null
+/** Tail of the running child's stderr, quoted when it dies. */
+let childStderr: LineTail | null = null
 let server: ServerInfo | null = null
+/** Bumped by `stopServer`, so a start still in flight knows to stand down. */
+let generation = 0
+/** In-flight start, shared by pre-warm and every caller that arrives before it settles. */
+let starting: Promise<ServerInfo> | null = null
 let sessionID: string | null = null
 let activeSessionID: string | null = null
 let streamAbort: AbortController | null = null
+/** Resolves once the event stream is subscribed; shared like `starting`. */
+let streamOpen: Promise<void> | null = null
+
+/**
+ * Admitted prompts whose execution has not ended, oldest first. The bus tags
+ * events with a session, not a prompt; OpenCode runs a session's prompts one
+ * at a time in admission order, so the head owns every event until its
+ * execution succeeds or fails. Each event leaves tagged with that id, which
+ * lets the renderer route by request instead of to "the latest message".
+ */
+const inflight: string[] = []
 
 /** Sink for batches leaving the service; wired to the renderer by main. */
 let streamSink: ((batch: OpencodeStreamBatch) => void) | null = null
@@ -67,8 +96,18 @@ function authHeaders(password: string): Record<string, string> {
   return { Authorization: `Basic ${token}` }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer)
+        resolve()
+      },
+      { once: true },
+    )
+  })
 }
 
 async function isHealthy(info: ServerInfo): Promise<boolean> {
@@ -86,10 +125,20 @@ async function isHealthy(info: ServerInfo): Promise<boolean> {
 /**
  * Start a dedicated `opencode serve` on a deterministic port with a
  * per-run random password. Tries the next port up when one is taken.
+ *
+ * Concurrent callers share one start: pre-warm and a message typed before
+ * the server is up must not race two spawns onto the same ports. A failed
+ * start is forgotten, so the next caller tries again.
  */
-export async function ensureServer(): Promise<ServerInfo> {
-  if (server) return server
+export function ensureServer(): Promise<ServerInfo> {
+  if (server) return Promise.resolve(server)
+  starting ??= startServer().finally(() => {
+    starting = null
+  })
+  return starting
+}
 
+async function startServer(): Promise<ServerInfo> {
   // Point the service at an already-running server instead of spawning one.
   // scripts/bench.ts uses this to substitute a deterministic fake; it is also
   // the hook for attaching to an `opencode serve` you started yourself.
@@ -100,33 +149,152 @@ export async function ensureServer(): Promise<ServerInfo> {
     return server
   }
 
-  const password = randomBytes(24).toString('base64url')
-  for (let attempt = 0; attempt < PORT_ATTEMPTS; attempt++) {
-    const port = BASE_PORT + attempt
-    const candidate: ServerInfo = { url: `http://127.0.0.1:${port}`, password }
-
-    const proc = spawn('opencode', ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
-      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
-      stdio: 'ignore',
-    })
-
-    for (let poll = 0; poll < HEALTH_POLLS; poll++) {
-      await sleep(HEALTH_POLL_MS)
-      if (proc.exitCode !== null) break // died — port conflict or opencode missing
-      if (await isHealthy(candidate)) {
-        child = proc
-        server = candidate
-        log.info('opencode serve ready', { url: candidate.url })
-        return candidate
-      }
+  // Probe rather than spawn-and-watch: a port held by something else (often
+  // an orphaned server from a previous run) is skipped in under a millisecond.
+  const basePort = Number(process.env.HARNESS_OPENCODE_PORT) || BASE_PORT
+  let port: number | null = null
+  for (let candidate = basePort; candidate < basePort + PORT_ATTEMPTS; candidate++) {
+    if (await isPortFree(candidate)) {
+      port = candidate
+      break
     }
-    proc.kill()
+    log.info('port in use, trying the next', { port: candidate })
   }
-  throw new Error('opencode serve failed to start (ports 4096–4099); is `opencode` on PATH?')
+  if (port === null) {
+    throw new Error(
+      `opencode serve failed to start: ports ${basePort}–${basePort + PORT_ATTEMPTS - 1} are all in use`,
+    )
+  }
+  return spawnServer(port, generation)
 }
 
-/** Create a session lazily, once per app run, rooted at the harness cwd. */
+/**
+ * Spawn on a port known to be free and poll until healthy. The port was free
+ * a moment ago, so an early exit is the server's own failure (bad config,
+ * wrong version, auth) — reported with its stderr instead of retried elsewhere.
+ */
+async function spawnServer(port: number, gen: number): Promise<ServerInfo> {
+  const info: ServerInfo = {
+    url: `http://127.0.0.1:${port}`,
+    password: randomBytes(24).toString('base64url'),
+  }
+  const proc = spawn('opencode', ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
+    env: { ...process.env, OPENCODE_SERVER_PASSWORD: info.password },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  const stderr = new LineTail(STDERR_LINES)
+  proc.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk))
+
+  // Wakes the poll the moment the child dies, rather than at the next tick.
+  // A missing binary is reported as an `error` event, and an unhandled one
+  // throws — at launch, now that the server is pre-warmed.
+  const died = new AbortController()
+  let spawnError: Error | null = null
+  proc.on('error', (err) => {
+    spawnError = err
+    died.abort()
+  })
+  proc.once('exit', () => died.abort())
+
+  const fail = async (reason: string): Promise<never> => {
+    await terminate(proc, KILL_GRACE_MS)
+    const tail = stderr.toString()
+    throw new Error(`opencode serve failed to start: ${reason}${tail ? `\n${tail}` : ''}`)
+  }
+
+  const deadline = performance.now() + STARTUP_BUDGET_MS
+  for (let poll = 0; ; poll++) {
+    if (gen !== generation) return fail('stopped during startup')
+    if (spawnError) {
+      const missing = (spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+      return fail(missing ? '`opencode` not found on PATH' : String(spawnError))
+    }
+    if (hasExited(proc)) {
+      return fail(`exited with ${proc.signalCode ?? `code ${proc.exitCode}`} on port ${port}`)
+    }
+    if (await isHealthy(info)) break
+    if (performance.now() >= deadline) {
+      return fail(`not healthy after ${STARTUP_BUDGET_MS / 1000} s on port ${port}`)
+    }
+    await sleep(exponentialDelay(poll, HEALTH_POLL_BASE_MS, HEALTH_POLL_MAX_MS), died.signal)
+  }
+  if (gen !== generation) return fail('stopped during startup')
+
+  child = proc
+  childStderr = stderr
+  server = info
+  proc.once('exit', (code, signal) => onChildExit(proc, code, signal))
+  log.info('opencode serve ready', { url: info.url })
+  return info
+}
+
+/**
+ * The server died under a live session. Without this the pump would retry a
+ * dead port until its ceiling while the UI shows `…`; instead the renderer
+ * gets the cause now, and the next message starts a fresh server.
+ */
+function onChildExit(proc: ChildProcess, code: number | null, signal: string | null): void {
+  if (proc !== child) return // deliberate stop, or already replaced
+  const tail = childStderr?.toString() ?? ''
+  const message = `opencode serve exited unexpectedly (${signal ?? `code ${code}`})${tail ? `\n${tail}` : ''}`
+  log.error(message)
+  streamAbort?.abort()
+  failInflight(message)
+  resetState()
+}
+
+/** Settle every request still waiting on the stream with `message`. */
+function failInflight(message: string): void {
+  if (inflight.length === 0) batcher.push({ type: 'error', message })
+  for (const requestId of inflight.splice(0)) batcher.push({ type: 'error', message, requestId })
+  batcher.flush()
+}
+
+/** Tag with the request that owns the stream right now; release it at the end of its run. */
+function emitForHead(event: OpencodeStreamEvent): void {
+  const requestId = inflight[0]
+  if (requestId !== undefined) event.requestId = requestId
+  batcher.push(event)
+}
+
+function resetState(): void {
+  streamAbort = null
+  streamOpen = null
+  starting = null
+  child = null
+  childStderr = null
+  server = null
+  sessionID = null
+  activeSessionID = null
+  inflight.length = 0
+}
+
+/**
+ * Boot the server in the background at launch so the first message does not
+ * pay for it. Failure is logged, not thrown: `sendMessage` retries the start
+ * and reports the error where the user can see it.
+ */
+export function prewarm(): void {
+  ensureServer().catch((err: unknown) => {
+    log.warn('pre-warm failed; will retry on first message', err)
+  })
+}
+
+/**
+ * Create a session lazily, once per app run, rooted at the harness cwd, and
+ * make sure the event stream is subscribed before the caller prompts it.
+ *
+ * The bus does not replay: anything emitted between a prompt being admitted
+ * and the stream connecting is lost — a response that intermittently starts
+ * mid-sentence. Subscribing first is the only ordering that cannot drop.
+ * The two requests are independent, so they run concurrently.
+ */
 async function ensureSession(info: ServerInfo): Promise<string> {
+  const [id] = await Promise.all([createSession(info), ensureStream(info)])
+  return id
+}
+
+async function createSession(info: ServerInfo): Promise<string> {
   if (sessionID) return sessionID
   const res = await fetch(`${info.url}/api/session`, {
     method: 'POST',
@@ -141,24 +309,33 @@ async function ensureSession(info: ServerInfo): Promise<string> {
   return sessionID
 }
 
-/** Admit a user message and start (or resume) the event pump. */
-export async function sendMessage(text: string): Promise<void> {
+/**
+ * Admit a user message into the session. Events arrive via `onStreamEvent`,
+ * tagged with `requestId` — the caller's own id for the message, or a
+ * generated one. Resolves to that id.
+ */
+export async function sendMessage(text: string, requestId: string = randomUUID()): Promise<string> {
   const info = await ensureServer()
   const id = await ensureSession(info)
-
-  const res = await fetch(`${info.url}/api/session/${id}/prompt`, {
-    method: 'POST',
-    headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  })
-  if (!res.ok) throw new Error(`prompt: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
-
+  // Both set before the POST: the first events can arrive before its response.
   activeSessionID = id
-  if (!streamAbort) {
-    streamAbort = new AbortController()
-    void pump(info, streamAbort.signal)
+  inflight.push(requestId)
+
+  try {
+    const res = await fetch(`${info.url}/api/session/${id}/prompt`, {
+      method: 'POST',
+      headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (!res.ok) throw new Error(`prompt: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
+  } catch (err) {
+    // Never admitted, so it will never run: it must not claim later events.
+    const index = inflight.indexOf(requestId)
+    if (index !== -1) inflight.splice(index, 1)
+    throw err
   }
-  log.info('message admitted', { sessionID: id })
+  log.info('message admitted', { sessionID: id, requestId })
+  return requestId
 }
 
 function mapEvent(event: RawEvent, emit: (evt: OpencodeStreamEvent) => void): void {
@@ -214,35 +391,115 @@ async function approvePermission(
   }
 }
 
-async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
-  const decoder = new SseDecoder()
-  while (!signal.aborted) {
-    try {
-      const res = await fetch(`${info.url}/api/event`, {
-        headers: authHeaders(info.password),
-        signal,
-      })
-      if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
+async function connectEvents(
+  info: ServerInfo,
+  signal: AbortSignal,
+  lastEventId = '',
+): Promise<ReadableStream<Uint8Array>> {
+  const headers = authHeaders(info.password)
+  // SSE resumption: a server that honors it replays what the drop lost. One
+  // that does not (OpenCode's bus today, as far as we know) ignores a header.
+  if (lastEventId) headers['Last-Event-ID'] = lastEventId
+  const res = await fetch(`${info.url}/api/event`, { headers, signal })
+  if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
+  return res.body
+}
 
-      const reader = res.body.getReader()
+/**
+ * Subscribe to the event bus once. Resolves when the server has accepted the
+ * connection (response headers received), which is the point from which
+ * events are delivered; a failed first connect rejects and is forgotten.
+ */
+function ensureStream(info: ServerInfo): Promise<void> {
+  streamOpen ??= (async () => {
+    const abort = new AbortController()
+    streamAbort = abort
+    try {
+      const body = await connectEvents(info, abort.signal)
+      void pump(info, abort.signal, body)
+    } catch (err) {
+      if (streamAbort === abort) {
+        streamAbort = null
+        streamOpen = null
+      }
+      throw err
+    }
+  })()
+  return streamOpen
+}
+
+/**
+ * Drain the open stream, reconnecting whenever it drops, until aborted. Gives
+ * up after `RECONNECT_ATTEMPTS` consecutive failures and tells the renderer,
+ * rather than retrying a dead server forever behind a silent spinner; the
+ * next `sendMessage` subscribes afresh.
+ */
+async function pump(
+  info: ServerInfo,
+  signal: AbortSignal,
+  opened: ReadableStream<Uint8Array>,
+): Promise<void> {
+  let body: ReadableStream<Uint8Array> | null = opened
+  let lastEventId = ''
+  let attempt = 0
+  let lastError: unknown
+  while (!signal.aborted) {
+    // Fresh per connection: a frame cut off by a drop must not prefix the
+    // first bytes of the next stream. Only the event id carries over.
+    const decoder = new SseDecoder({ lastEventId })
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
+    try {
+      body ??= await connectEvents(info, signal, lastEventId)
+      attempt = 0
+      reader = body.getReader()
       for (;;) {
         const read = (await reader.read()) as { done: boolean; value?: Uint8Array }
         if (read.done || !read.value) break
         for (const raw of decoder.push(read.value)) {
           const evt = raw as RawEvent
-          if (evt.type === 'permission.asked' && evt.data?.sessionID === activeSessionID && evt.data.id) {
+          if (
+            evt.type === 'permission.asked' &&
+            evt.data?.sessionID === activeSessionID &&
+            evt.data.id
+          ) {
             const detail = `${evt.data.action ?? 'permission'} ${(evt.data.resources ?? []).join(', ')}`
-            batcher.push({ type: 'tool', state: 'running', detail })
+            emitForHead({ type: 'tool', state: 'running', detail })
             void approvePermission(info, evt.data.sessionID, evt.data.id)
           }
-          mapEvent(evt, (mapped) => batcher.push(mapped))
+          mapEvent(evt, (mapped) => {
+            emitForHead(mapped)
+            if (mapped.type === 'done' || mapped.type === 'error') inflight.shift()
+          })
         }
       }
+      lastError = new Error('event stream closed by server')
     } catch (err) {
       if (signal.aborted) return
-      log.warn('event stream dropped, reconnecting', err)
+      lastError = err
+    } finally {
+      lastEventId = decoder.lastEventId
+      reader?.cancel().catch(() => undefined)
     }
-    await sleep(RECONNECT_DELAY_MS)
+    body = null
+
+    if (attempt >= RECONNECT_ATTEMPTS) {
+      const reason = lastError instanceof Error ? lastError.message : String(lastError)
+      const message = `event stream lost after ${attempt} reconnect attempts: ${reason}`
+      log.error(message)
+      failInflight(message)
+      if (streamAbort?.signal === signal) {
+        streamAbort = null
+        streamOpen = null
+      }
+      return
+    }
+    const delayMs = fullJitterDelay(attempt++, RECONNECT_BASE_MS, RECONNECT_MAX_MS)
+    log.warn(
+      'event stream dropped, reconnecting',
+      { attempt, delayMs: Math.round(delayMs) },
+      lastError,
+    )
+    await sleep(delayMs, signal)
   }
 }
 
@@ -250,15 +507,17 @@ export function onStreamEvent(sink: (batch: OpencodeStreamBatch) => void): void 
   streamSink = sink
 }
 
-/** Tear down the server child and all state. Called on app quit. */
-export function stopServer(): void {
+/**
+ * Tear down the server child and all state, and wait until it has exited.
+ * Called on app quit, which defers until this resolves. A start still in
+ * flight sees the generation change and kills its own child.
+ */
+export async function stopServer(): Promise<void> {
+  generation++
   streamAbort?.abort()
-  streamAbort = null
-  if (child?.exitCode === null) child.kill()
-  child = null
-  server = null
-  sessionID = null
-  activeSessionID = null
+  const proc = child
+  resetState() // before signalling, so the exit is not reported as a crash
+  if (proc) await terminate(proc, KILL_GRACE_MS)
   streamSink = null
   batcher.dispose()
   log.info('stopped')

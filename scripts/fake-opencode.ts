@@ -13,7 +13,7 @@
  * surface used here is four routes and one `data:` line; a framework would be
  * more code than the server.
  */
-import { createServer, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
 export interface FakeOpencodeOptions {
@@ -23,14 +23,35 @@ export interface FakeOpencodeOptions {
   rate: number
   /** Payload of each delta. Fixed width keeps per-event cost comparable. */
   token?: string
+  /**
+   * Model the real bus: start emitting the moment a prompt is admitted, whether
+   * or not a stream is connected, and drop what nobody is subscribed to. The
+   * first delta goes out before the prompt's HTTP response does. Off by default
+   * so the benchmark's delta count stays deterministic.
+   */
+  startOnPrompt?: boolean
+  /** Admit prompts but emit nothing on its own; the caller drives the stream via `write`. */
+  manual?: boolean
+  /** Port to listen on. Defaults to an ephemeral one. */
+  port?: number
 }
 
 export interface FakeOpencode {
   url: string
   close(): Promise<void>
+  // Fault injection, for the service's own tests.
+  /** Headers of every `/api/event` request, in arrival order. */
+  readonly eventRequests: IncomingHttpHeaders[]
+  /** Write raw bytes to the connected event stream — partial frames included. */
+  write(raw: string): void
+  /** Destroy the connected event stream mid-flight, as a network drop would. */
+  drop(): void
+  /** Answer later `/api/event` requests with this status; `null` serves normally. */
+  failEvents(status: number | null): void
 }
 
-const SESSION_ID = 'bench-session'
+export const FAKE_SESSION_ID = 'bench-session'
+const SESSION_ID = FAKE_SESSION_ID
 const DEFAULT_TOKEN = 'lorem '
 
 function sse(payload: unknown): string {
@@ -38,13 +59,13 @@ function sse(payload: unknown): string {
 }
 
 /**
- * Starts the server on an ephemeral port and resolves once it is listening.
+ * Starts the server and resolves once it is listening.
  *
- * Emission begins only when a prompt has been admitted **and** the event stream
- * is connected, in whichever order those happen. The app under test currently
- * POSTs the prompt before opening the stream, so waiting for both is what makes
- * the delta count deterministic — otherwise the benchmark would silently
- * measure a short stream and report flattering percentiles.
+ * By default emission begins only when a prompt has been admitted **and** the
+ * event stream is connected, in whichever order those happen. Waiting for both
+ * keeps the delta count deterministic whatever order the client uses —
+ * otherwise a regression in that ordering would silently measure a short stream
+ * and report flattering percentiles. `startOnPrompt` drops that courtesy.
  */
 export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpencode> {
   const token = options.token ?? DEFAULT_TOKEN
@@ -54,25 +75,31 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
   let stream: ServerResponse | null = null
   let timer: NodeJS.Timeout | null = null
   let sent = 0
+  let eventStatus: number | null = null
+  const eventRequests: IncomingHttpHeaders[] = []
 
   const stopTimer = (): void => {
     if (timer) clearInterval(timer)
     timer = null
   }
 
+  const tick = (): void => {
+    if (!stream && !options.startOnPrompt) return stopTimer()
+    if (sent >= options.deltas) {
+      stream?.write(sse({ type: 'session.execution.succeeded', data: { sessionID: SESSION_ID } }))
+      return stopTimer()
+    }
+    sent++
+    stream?.write(
+      sse({ type: 'session.text.delta', data: { sessionID: SESSION_ID, delta: token } }),
+    )
+  }
+
   const maybeStart = (): void => {
-    if (!prompted || !stream || timer) return
-    timer = setInterval(() => {
-      if (!stream) return stopTimer()
-      if (sent >= options.deltas) {
-        stream.write(sse({ type: 'session.execution.succeeded', data: { sessionID: SESSION_ID } }))
-        return stopTimer()
-      }
-      sent++
-      stream.write(
-        sse({ type: 'session.text.delta', data: { sessionID: SESSION_ID, delta: token } }),
-      )
-    }, intervalMs)
+    if (!prompted || timer || options.manual) return
+    if (options.startOnPrompt) tick()
+    else if (!stream) return
+    timer = setInterval(tick, intervalMs)
   }
 
   const server: Server = createServer((req, res) => {
@@ -92,15 +119,22 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
 
     if (url.endsWith('/prompt') && req.method === 'POST') {
       req.resume()
+      // Admit, then answer — the agent loop is already running server-side by
+      // the time the client learns the prompt was accepted.
       req.on('end', () => {
         prompted = true
         maybeStart()
+        res.writeHead(200, { 'Content-Type': 'application/json' }).end('{}')
       })
-      res.writeHead(200, { 'Content-Type': 'application/json' }).end('{}')
       return
     }
 
     if (url === '/api/event') {
+      eventRequests.push(req.headers)
+      if (eventStatus !== null) {
+        res.writeHead(eventStatus).end()
+        return
+      }
       // Nagle would coalesce small frames into ~40 ms batches and the benchmark
       // would measure the kernel's buffering instead of the app's.
       req.socket.setNoDelay(true)
@@ -124,10 +158,16 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
 
   return new Promise((resolve, reject) => {
     server.on('error', reject)
-    server.listen(0, '127.0.0.1', () => {
+    server.listen(options.port ?? 0, '127.0.0.1', () => {
       const { port } = server.address() as AddressInfo
       resolve({
         url: `http://127.0.0.1:${port}`,
+        eventRequests,
+        write: (raw) => stream?.write(raw),
+        drop: () => stream?.destroy(),
+        failEvents: (status) => {
+          eventStatus = status
+        },
         close: () =>
           new Promise<void>((done) => {
             stopTimer()
