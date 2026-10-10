@@ -4,8 +4,9 @@ import { randomBytes } from 'node:crypto'
 import { createLogger } from '@shared/logger'
 import type { OpencodeStreamBatch, OpencodeStreamEvent } from '@shared/opencode-stream'
 
-import { fullJitterDelay } from './backoff'
+import { exponentialDelay, fullJitterDelay } from './backoff'
 import { createBatcher } from './batch'
+import { LineTail, hasExited, isPortFree, terminate } from './process'
 import { SseDecoder } from './sse'
 
 /**
@@ -25,8 +26,14 @@ const log = createLogger('opencode')
 const BASE_PORT = 4096
 const PORT_ATTEMPTS = 4
 const HEALTH_TIMEOUT_MS = 2_000
-const HEALTH_POLL_MS = 250
-const HEALTH_POLLS = 60 // ~15s startup budget
+// Probe immediately, then poll 25 ms → 250 ms: a fast start is noticed within
+// a few ms, a slow one is not hammered. 15 s total before giving up.
+const HEALTH_POLL_BASE_MS = 25
+const HEALTH_POLL_MAX_MS = 250
+const STARTUP_BUDGET_MS = 15_000
+/** SIGTERM grace before SIGKILL, on stop and on a failed start. */
+const KILL_GRACE_MS = 2_000
+const STDERR_LINES = 20
 // Event-stream reconnects: full-jitter exponential backoff, 1 s → 30 s.
 // Ten consecutive failures (~1.5 min expected) is a server that is gone.
 const RECONNECT_BASE_MS = 1_000
@@ -52,7 +59,11 @@ interface RawEvent {
 }
 
 let child: ChildProcess | null = null
+/** Tail of the running child's stderr, quoted when it dies. */
+let childStderr: LineTail | null = null
 let server: ServerInfo | null = null
+/** Bumped by `stopServer`, so a start still in flight knows to stand down. */
+let generation = 0
 /** In-flight start, shared by pre-warm and every caller that arrives before it settles. */
 let starting: Promise<ServerInfo> | null = null
 let sessionID: string | null = null
@@ -129,40 +140,110 @@ async function startServer(): Promise<ServerInfo> {
     return server
   }
 
+  // Probe rather than spawn-and-watch: a port held by something else (often
+  // an orphaned server from a previous run) is skipped in under a millisecond.
   const basePort = Number(process.env.HARNESS_OPENCODE_PORT) || BASE_PORT
-  const lastPort = basePort + PORT_ATTEMPTS - 1
-  const password = randomBytes(24).toString('base64url')
-  for (let attempt = 0; attempt < PORT_ATTEMPTS; attempt++) {
-    const port = basePort + attempt
-    const candidate: ServerInfo = { url: `http://127.0.0.1:${port}`, password }
-
-    const proc = spawn('opencode', ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
-      env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
-      stdio: 'ignore',
-    })
-    // A missing binary is reported as an `error` event, and an unhandled one
-    // throws — at launch, now that the server is pre-warmed.
-    let spawnError: Error | null = null
-    proc.on('error', (err) => {
-      spawnError = err
-    })
-
-    for (let poll = 0; poll < HEALTH_POLLS; poll++) {
-      await sleep(HEALTH_POLL_MS)
-      if (spawnError) throw new Error(`opencode serve failed to start: ${String(spawnError)}`)
-      if (proc.exitCode !== null) break // died — port conflict or opencode missing
-      if (await isHealthy(candidate)) {
-        child = proc
-        server = candidate
-        log.info('opencode serve ready', { url: candidate.url })
-        return candidate
-      }
+  let port: number | null = null
+  for (let candidate = basePort; candidate < basePort + PORT_ATTEMPTS; candidate++) {
+    if (await isPortFree(candidate)) {
+      port = candidate
+      break
     }
-    proc.kill()
+    log.info('port in use, trying the next', { port: candidate })
   }
-  throw new Error(
-    `opencode serve failed to start (ports ${basePort}–${lastPort}); is \`opencode\` on PATH?`,
-  )
+  if (port === null) {
+    throw new Error(
+      `opencode serve failed to start: ports ${basePort}–${basePort + PORT_ATTEMPTS - 1} are all in use`,
+    )
+  }
+  return spawnServer(port, generation)
+}
+
+/**
+ * Spawn on a port known to be free and poll until healthy. The port was free
+ * a moment ago, so an early exit is the server's own failure (bad config,
+ * wrong version, auth) — reported with its stderr instead of retried elsewhere.
+ */
+async function spawnServer(port: number, gen: number): Promise<ServerInfo> {
+  const info: ServerInfo = {
+    url: `http://127.0.0.1:${port}`,
+    password: randomBytes(24).toString('base64url'),
+  }
+  const proc = spawn('opencode', ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
+    env: { ...process.env, OPENCODE_SERVER_PASSWORD: info.password },
+    stdio: ['ignore', 'ignore', 'pipe'],
+  })
+  const stderr = new LineTail(STDERR_LINES)
+  proc.stderr?.on('data', (chunk: Buffer) => stderr.push(chunk))
+
+  // Wakes the poll the moment the child dies, rather than at the next tick.
+  // A missing binary is reported as an `error` event, and an unhandled one
+  // throws — at launch, now that the server is pre-warmed.
+  const died = new AbortController()
+  let spawnError: Error | null = null
+  proc.on('error', (err) => {
+    spawnError = err
+    died.abort()
+  })
+  proc.once('exit', () => died.abort())
+
+  const fail = async (reason: string): Promise<never> => {
+    await terminate(proc, KILL_GRACE_MS)
+    const tail = stderr.toString()
+    throw new Error(`opencode serve failed to start: ${reason}${tail ? `\n${tail}` : ''}`)
+  }
+
+  const deadline = performance.now() + STARTUP_BUDGET_MS
+  for (let poll = 0; ; poll++) {
+    if (gen !== generation) return fail('stopped during startup')
+    if (spawnError) {
+      const missing = (spawnError as NodeJS.ErrnoException).code === 'ENOENT'
+      return fail(missing ? '`opencode` not found on PATH' : String(spawnError))
+    }
+    if (hasExited(proc)) {
+      return fail(`exited with ${proc.signalCode ?? `code ${proc.exitCode}`} on port ${port}`)
+    }
+    if (await isHealthy(info)) break
+    if (performance.now() >= deadline) {
+      return fail(`not healthy after ${STARTUP_BUDGET_MS / 1000} s on port ${port}`)
+    }
+    await sleep(exponentialDelay(poll, HEALTH_POLL_BASE_MS, HEALTH_POLL_MAX_MS), died.signal)
+  }
+  if (gen !== generation) return fail('stopped during startup')
+
+  child = proc
+  childStderr = stderr
+  server = info
+  proc.once('exit', (code, signal) => onChildExit(proc, code, signal))
+  log.info('opencode serve ready', { url: info.url })
+  return info
+}
+
+/**
+ * The server died under a live session. Without this the pump would retry a
+ * dead port until its ceiling while the UI shows `…`; instead the renderer
+ * gets the cause now, and the next message starts a fresh server.
+ */
+function onChildExit(proc: ChildProcess, code: number | null, signal: string | null): void {
+  if (proc !== child) return // deliberate stop, or already replaced
+  const tail = childStderr?.toString() ?? ''
+  const message = `opencode serve exited unexpectedly (${signal ?? `code ${code}`})${tail ? `\n${tail}` : ''}`
+  log.error(message)
+  streamAbort?.abort()
+  resetState()
+  batcher.push({ type: 'error', message })
+  batcher.flush()
+}
+
+function resetState(): void {
+  streamAbort = null
+  streamOpen = null
+  starting = null
+  child = null
+  childStderr = null
+  server = null
+  sessionID = null
+  activeSessionID = null
 }
 
 /**
@@ -388,17 +469,17 @@ export function onStreamEvent(sink: (batch: OpencodeStreamBatch) => void): void 
   streamSink = sink
 }
 
-/** Tear down the server child and all state. Called on app quit. */
-export function stopServer(): void {
+/**
+ * Tear down the server child and all state, and wait until it has exited.
+ * Called on app quit, which defers until this resolves. A start still in
+ * flight sees the generation change and kills its own child.
+ */
+export async function stopServer(): Promise<void> {
+  generation++
   streamAbort?.abort()
-  streamAbort = null
-  streamOpen = null
-  starting = null
-  if (child?.exitCode === null) child.kill()
-  child = null
-  server = null
-  sessionID = null
-  activeSessionID = null
+  const proc = child
+  resetState() // before signalling, so the exit is not reported as a crash
+  if (proc) await terminate(proc, KILL_GRACE_MS)
   streamSink = null
   batcher.dispose()
   log.info('stopped')

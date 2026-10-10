@@ -1,4 +1,4 @@
-import { EventEmitter } from 'node:events'
+import { EventEmitter, once } from 'node:events'
 import { createServer } from 'node:net'
 import type { AddressInfo } from 'node:net'
 import { PassThrough } from 'node:stream'
@@ -26,6 +26,7 @@ vi.mock('node:child_process', () => ({ spawn: mocks.spawn }))
 
 /** A ChildProcess stand-in whose "process" is a fake server on `--port`. */
 class FakeChild extends EventEmitter {
+  pid: number | undefined = 4242
   exitCode: number | null = null
   signalCode: NodeJS.Signals | null = null
   readonly stderr = new PassThrough()
@@ -63,10 +64,22 @@ function spawnFakeServer(_cmd: string, args: string[]): FakeChild {
 
 function spawnMissingBinary(): FakeChild {
   const child = new FakeChild()
+  child.pid = undefined
   children.push(child)
   setImmediate(() =>
     child.emit('error', Object.assign(new Error('spawn opencode ENOENT'), { code: 'ENOENT' })),
   )
+  return child
+}
+
+/** A server that complains on stderr and exits before it ever listens. */
+function spawnBadConfig(): FakeChild {
+  const child = new FakeChild()
+  children.push(child)
+  setImmediate(() => {
+    child.stderr.write('Error: invalid opencode.json\n  at line 3: unexpected token\n')
+    setImmediate(() => child.exit(1))
+  })
   return child
 }
 
@@ -99,7 +112,7 @@ beforeEach(() => {
 })
 
 afterEach(async () => {
-  stopServer()
+  await stopServer()
   await Promise.all(children.flatMap((child) => (child.server ? [child.server.close()] : [])))
 })
 
@@ -234,5 +247,103 @@ describe('pre-warm', () => {
     } finally {
       process.off('unhandledRejection', unhandled)
     }
+  })
+})
+
+describe('process supervision', () => {
+  let basePort: number
+
+  beforeEach(async () => {
+    basePort = await freePort()
+    process.env.HARNESS_OPENCODE_PORT = String(basePort)
+  })
+
+  function portsSpawnedOn(): number[] {
+    return mocks.spawn.mock.calls.map(([, args]) => {
+      const argv = args as string[]
+      return Number(argv[argv.indexOf('--port') + 1])
+    })
+  }
+
+  it('includes the server stderr in the startup error', async () => {
+    mocks.spawn.mockImplementation(spawnBadConfig)
+    await expect(ensureServer()).rejects.toThrow(/invalid opencode\.json[\s\S]*unexpected token/)
+  })
+
+  it('does not retry other ports when the server itself fails', async () => {
+    mocks.spawn.mockImplementation(spawnBadConfig)
+    await ensureServer().catch(() => undefined)
+    expect(mocks.spawn).toHaveBeenCalledTimes(1)
+  })
+
+  it('skips a taken port without spawning on it', async () => {
+    const holder = createServer().listen(basePort, '127.0.0.1')
+    await once(holder, 'listening')
+    mocks.spawn.mockImplementation(spawnFakeServer)
+    try {
+      await ensureServer()
+      expect(portsSpawnedOn()).toEqual([basePort + 1])
+    } finally {
+      await new Promise((resolve) => holder.close(resolve))
+    }
+  })
+
+  it('probes health immediately instead of sleeping first', async () => {
+    mocks.spawn.mockImplementation(spawnFakeServer)
+    const started = performance.now()
+    await ensureServer()
+    expect(performance.now() - started).toBeLessThan(150)
+  })
+
+  it('reports a server that dies mid-session to the sink, with its stderr', async () => {
+    mocks.spawn.mockImplementation(spawnFakeServer)
+    const events = collect()
+    await sendMessage('hi')
+
+    const [child] = children
+    child.stderr.write('panic: out of memory\n')
+    await new Promise((resolve) => setImmediate(resolve))
+    child.exit(137)
+
+    await vi.waitFor(() => {
+      const error = events.find((event) => event.type === 'error')
+      expect(error?.message).toMatch(/exited[\s\S]*137[\s\S]*out of memory/)
+    })
+  })
+
+  it('respawns on the next message after the server died', async () => {
+    mocks.spawn.mockImplementation(spawnFakeServer)
+    collect()
+    await sendMessage('hi')
+    children[0].exit(1)
+
+    await sendMessage('again')
+
+    expect(mocks.spawn).toHaveBeenCalledTimes(2)
+  })
+
+  it('reports nothing when the server is stopped deliberately', async () => {
+    mocks.spawn.mockImplementation(spawnFakeServer)
+    const events = collect()
+    await sendMessage('hi')
+    const [child] = children
+
+    await stopServer()
+
+    expect(child.signalCode).toBe('SIGTERM')
+    expect(events.filter((event) => event.type === 'error')).toEqual([])
+  })
+
+  it('kills a server that finishes starting after stop was requested', async () => {
+    const stops: Promise<void>[] = []
+    mocks.spawn.mockImplementation((cmd: string, args: string[]) => {
+      const child = spawnFakeServer(cmd, args)
+      stops.push(stopServer()) // quit lands while the child is still booting
+      return child
+    })
+
+    await expect(ensureServer()).rejects.toThrow(/stopped/)
+    await Promise.all(stops)
+    expect(children[0].signalCode).toBe('SIGTERM')
   })
 })
