@@ -5,7 +5,7 @@ import { BrowserWindow, app } from 'electron'
 import { createLogger } from '@shared/logger'
 
 import { readChromeState, registerIpcHandlers } from './ipc'
-import { stopServer } from './services/opencode'
+import { prewarm, stopServer } from './services/opencode'
 
 const log = createLogger('main')
 
@@ -76,6 +76,11 @@ function createWindow(): void {
       win.setWindowButtonPosition({ x: 16, y: 20 })
     }
     win.show()
+    // Boot OpenCode now so the first message finds it up. Not earlier: the
+    // spawn is a whole Bun runtime starting, and measured alongside renderer
+    // startup it cost cold-start up to ~80 ms p50. Nobody can type before the
+    // window is shown, so starting here hides the same boot for free.
+    prewarm()
   })
 
   // The streaming benchmark needs a window that actually composites frames, so

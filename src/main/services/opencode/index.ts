@@ -48,9 +48,13 @@ interface RawEvent {
 
 let child: ChildProcess | null = null
 let server: ServerInfo | null = null
+/** In-flight start, shared by pre-warm and every caller that arrives before it settles. */
+let starting: Promise<ServerInfo> | null = null
 let sessionID: string | null = null
 let activeSessionID: string | null = null
 let streamAbort: AbortController | null = null
+/** Resolves once the event stream is subscribed; shared like `starting`. */
+let streamOpen: Promise<void> | null = null
 
 /** Sink for batches leaving the service; wired to the renderer by main. */
 let streamSink: ((batch: OpencodeStreamBatch) => void) | null = null
@@ -86,10 +90,20 @@ async function isHealthy(info: ServerInfo): Promise<boolean> {
 /**
  * Start a dedicated `opencode serve` on a deterministic port with a
  * per-run random password. Tries the next port up when one is taken.
+ *
+ * Concurrent callers share one start: pre-warm and a message typed before
+ * the server is up must not race two spawns onto the same ports. A failed
+ * start is forgotten, so the next caller tries again.
  */
-export async function ensureServer(): Promise<ServerInfo> {
-  if (server) return server
+export function ensureServer(): Promise<ServerInfo> {
+  if (server) return Promise.resolve(server)
+  starting ??= startServer().finally(() => {
+    starting = null
+  })
+  return starting
+}
 
+async function startServer(): Promise<ServerInfo> {
   // Point the service at an already-running server instead of spawning one.
   // scripts/bench.ts uses this to substitute a deterministic fake; it is also
   // the hook for attaching to an `opencode serve` you started yourself.
@@ -100,18 +114,27 @@ export async function ensureServer(): Promise<ServerInfo> {
     return server
   }
 
+  const basePort = Number(process.env.HARNESS_OPENCODE_PORT) || BASE_PORT
+  const lastPort = basePort + PORT_ATTEMPTS - 1
   const password = randomBytes(24).toString('base64url')
   for (let attempt = 0; attempt < PORT_ATTEMPTS; attempt++) {
-    const port = BASE_PORT + attempt
+    const port = basePort + attempt
     const candidate: ServerInfo = { url: `http://127.0.0.1:${port}`, password }
 
     const proc = spawn('opencode', ['serve', '--port', String(port), '--hostname', '127.0.0.1'], {
       env: { ...process.env, OPENCODE_SERVER_PASSWORD: password },
       stdio: 'ignore',
     })
+    // A missing binary is reported as an `error` event, and an unhandled one
+    // throws — at launch, now that the server is pre-warmed.
+    let spawnError: Error | null = null
+    proc.on('error', (err) => {
+      spawnError = err
+    })
 
     for (let poll = 0; poll < HEALTH_POLLS; poll++) {
       await sleep(HEALTH_POLL_MS)
+      if (spawnError) throw new Error(`opencode serve failed to start: ${String(spawnError)}`)
       if (proc.exitCode !== null) break // died — port conflict or opencode missing
       if (await isHealthy(candidate)) {
         child = proc
@@ -122,11 +145,37 @@ export async function ensureServer(): Promise<ServerInfo> {
     }
     proc.kill()
   }
-  throw new Error('opencode serve failed to start (ports 4096–4099); is `opencode` on PATH?')
+  throw new Error(
+    `opencode serve failed to start (ports ${basePort}–${lastPort}); is \`opencode\` on PATH?`,
+  )
 }
 
-/** Create a session lazily, once per app run, rooted at the harness cwd. */
+/**
+ * Boot the server in the background at launch so the first message does not
+ * pay for it. Failure is logged, not thrown: `sendMessage` retries the start
+ * and reports the error where the user can see it.
+ */
+export function prewarm(): void {
+  ensureServer().catch((err: unknown) => {
+    log.warn('pre-warm failed; will retry on first message', err)
+  })
+}
+
+/**
+ * Create a session lazily, once per app run, rooted at the harness cwd, and
+ * make sure the event stream is subscribed before the caller prompts it.
+ *
+ * The bus does not replay: anything emitted between a prompt being admitted
+ * and the stream connecting is lost — a response that intermittently starts
+ * mid-sentence. Subscribing first is the only ordering that cannot drop.
+ * The two requests are independent, so they run concurrently.
+ */
 async function ensureSession(info: ServerInfo): Promise<string> {
+  const [id] = await Promise.all([createSession(info), ensureStream(info)])
+  return id
+}
+
+async function createSession(info: ServerInfo): Promise<string> {
   if (sessionID) return sessionID
   const res = await fetch(`${info.url}/api/session`, {
     method: 'POST',
@@ -141,10 +190,12 @@ async function ensureSession(info: ServerInfo): Promise<string> {
   return sessionID
 }
 
-/** Admit a user message and start (or resume) the event pump. */
+/** Admit a user message into the session. Events arrive via `onStreamEvent`. */
 export async function sendMessage(text: string): Promise<void> {
   const info = await ensureServer()
   const id = await ensureSession(info)
+  // Set before the POST: the first events can arrive before its response does.
+  activeSessionID = id
 
   const res = await fetch(`${info.url}/api/session/${id}/prompt`, {
     method: 'POST',
@@ -152,12 +203,6 @@ export async function sendMessage(text: string): Promise<void> {
     body: JSON.stringify({ text }),
   })
   if (!res.ok) throw new Error(`prompt: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
-
-  activeSessionID = id
-  if (!streamAbort) {
-    streamAbort = new AbortController()
-    void pump(info, streamAbort.signal)
-  }
   log.info('message admitted', { sessionID: id })
 }
 
@@ -214,23 +259,63 @@ async function approvePermission(
   }
 }
 
-async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
+async function connectEvents(
+  info: ServerInfo,
+  signal: AbortSignal,
+): Promise<ReadableStream<Uint8Array>> {
+  const res = await fetch(`${info.url}/api/event`, {
+    headers: authHeaders(info.password),
+    signal,
+  })
+  if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
+  return res.body
+}
+
+/**
+ * Subscribe to the event bus once. Resolves when the server has accepted the
+ * connection (response headers received), which is the point from which
+ * events are delivered; a failed first connect rejects and is forgotten.
+ */
+function ensureStream(info: ServerInfo): Promise<void> {
+  streamOpen ??= (async () => {
+    const abort = new AbortController()
+    streamAbort = abort
+    try {
+      const body = await connectEvents(info, abort.signal)
+      void pump(info, abort.signal, body)
+    } catch (err) {
+      if (streamAbort === abort) {
+        streamAbort = null
+        streamOpen = null
+      }
+      throw err
+    }
+  })()
+  return streamOpen
+}
+
+/** Drain the open stream, reconnecting whenever it drops, until aborted. */
+async function pump(
+  info: ServerInfo,
+  signal: AbortSignal,
+  opened: ReadableStream<Uint8Array>,
+): Promise<void> {
   const decoder = new SseDecoder()
+  let body: ReadableStream<Uint8Array> | null = opened
   while (!signal.aborted) {
     try {
-      const res = await fetch(`${info.url}/api/event`, {
-        headers: authHeaders(info.password),
-        signal,
-      })
-      if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
-
-      const reader = res.body.getReader()
+      body ??= await connectEvents(info, signal)
+      const reader = body.getReader()
       for (;;) {
         const read = (await reader.read()) as { done: boolean; value?: Uint8Array }
         if (read.done || !read.value) break
         for (const raw of decoder.push(read.value)) {
           const evt = raw as RawEvent
-          if (evt.type === 'permission.asked' && evt.data?.sessionID === activeSessionID && evt.data.id) {
+          if (
+            evt.type === 'permission.asked' &&
+            evt.data?.sessionID === activeSessionID &&
+            evt.data.id
+          ) {
             const detail = `${evt.data.action ?? 'permission'} ${(evt.data.resources ?? []).join(', ')}`
             batcher.push({ type: 'tool', state: 'running', detail })
             void approvePermission(info, evt.data.sessionID, evt.data.id)
@@ -242,6 +327,7 @@ async function pump(info: ServerInfo, signal: AbortSignal): Promise<void> {
       if (signal.aborted) return
       log.warn('event stream dropped, reconnecting', err)
     }
+    body = null
     await sleep(RECONNECT_DELAY_MS)
   }
 }
@@ -254,6 +340,8 @@ export function onStreamEvent(sink: (batch: OpencodeStreamBatch) => void): void 
 export function stopServer(): void {
   streamAbort?.abort()
   streamAbort = null
+  streamOpen = null
+  starting = null
   if (child?.exitCode === null) child.kill()
   child = null
   server = null
