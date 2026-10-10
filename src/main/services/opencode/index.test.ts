@@ -8,7 +8,11 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { setLogLevel } from '@shared/logger'
 import type { OpencodeStreamEvent } from '@shared/opencode-stream'
 
-import { startFakeOpencode, type FakeOpencode } from '../../../../scripts/fake-opencode'
+import {
+  FAKE_SESSION_ID,
+  startFakeOpencode,
+  type FakeOpencode,
+} from '../../../../scripts/fake-opencode'
 import { ensureServer, onStreamEvent, prewarm, sendMessage, stopServer } from '.'
 
 /**
@@ -114,6 +118,87 @@ describe('event stream ordering', () => {
     await sendMessage('hi')
 
     await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'first' }))
+  })
+})
+
+describe('event stream reconnect', () => {
+  let fake: FakeOpencode
+
+  function frame(payload: unknown, id?: string): string {
+    return `${id ? `id: ${id}\n` : ''}data: ${JSON.stringify(payload)}\n\n`
+  }
+
+  function delta(text: string): unknown {
+    return { type: 'session.text.delta', data: { sessionID: FAKE_SESSION_ID, delta: text } }
+  }
+
+  beforeEach(async () => {
+    // Full jitter with a zero draw: every reconnect is immediate.
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    fake = await startFakeOpencode({ deltas: 0, rate: 1000 })
+    process.env.HARNESS_OPENCODE_URL = fake.url
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    await fake.close()
+  })
+
+  it('discards a frame cut off by a drop instead of corrupting the next one', async () => {
+    const events = collect()
+    await sendMessage('hi')
+
+    fake.write('data: {"type":"session.text.del')
+    fake.drop()
+    await vi.waitFor(() => expect(fake.eventRequests).toHaveLength(2))
+    fake.write(frame(delta('after')))
+
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'after' }))
+  })
+
+  it('sends the last seen event id as Last-Event-ID on reconnect', async () => {
+    const events = collect()
+    await sendMessage('hi')
+
+    fake.write(frame(delta('one'), '41'))
+    fake.write(frame(delta('two'), '42'))
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'two' }))
+    fake.drop()
+
+    await vi.waitFor(() => expect(fake.eventRequests).toHaveLength(2))
+    expect(fake.eventRequests[0]['last-event-id']).toBeUndefined()
+    expect(fake.eventRequests[1]['last-event-id']).toBe('42')
+  })
+
+  it('reports an error to the sink after the retry ceiling instead of looping', async () => {
+    const events = collect()
+    await sendMessage('hi')
+
+    fake.failEvents(503)
+    fake.drop()
+
+    await vi.waitFor(() => {
+      const error = events.find((event) => event.type === 'error')
+      expect(error?.message).toMatch(/503/)
+    })
+    const attempts = fake.eventRequests.length
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    expect(fake.eventRequests).toHaveLength(attempts)
+  })
+
+  it('resubscribes on the next message after giving up', async () => {
+    collect()
+    await sendMessage('hi')
+    fake.failEvents(503)
+    fake.drop()
+    await vi.waitFor(() => expect(fake.eventRequests.length).toBeGreaterThan(2))
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    const attempts = fake.eventRequests.length
+
+    fake.failEvents(null)
+    await sendMessage('again')
+
+    expect(fake.eventRequests).toHaveLength(attempts + 1)
   })
 })
 

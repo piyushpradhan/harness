@@ -13,7 +13,7 @@
  * surface used here is four routes and one `data:` line; a framework would be
  * more code than the server.
  */
-import { createServer, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type Server, type ServerResponse } from 'node:http'
 import type { AddressInfo } from 'node:net'
 
 export interface FakeOpencodeOptions {
@@ -37,9 +37,19 @@ export interface FakeOpencodeOptions {
 export interface FakeOpencode {
   url: string
   close(): Promise<void>
+  // Fault injection, for the service's own tests.
+  /** Headers of every `/api/event` request, in arrival order. */
+  readonly eventRequests: IncomingHttpHeaders[]
+  /** Write raw bytes to the connected event stream — partial frames included. */
+  write(raw: string): void
+  /** Destroy the connected event stream mid-flight, as a network drop would. */
+  drop(): void
+  /** Answer later `/api/event` requests with this status; `null` serves normally. */
+  failEvents(status: number | null): void
 }
 
-const SESSION_ID = 'bench-session'
+export const FAKE_SESSION_ID = 'bench-session'
+const SESSION_ID = FAKE_SESSION_ID
 const DEFAULT_TOKEN = 'lorem '
 
 function sse(payload: unknown): string {
@@ -63,6 +73,8 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
   let stream: ServerResponse | null = null
   let timer: NodeJS.Timeout | null = null
   let sent = 0
+  let eventStatus: number | null = null
+  const eventRequests: IncomingHttpHeaders[] = []
 
   const stopTimer = (): void => {
     if (timer) clearInterval(timer)
@@ -116,6 +128,11 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
     }
 
     if (url === '/api/event') {
+      eventRequests.push(req.headers)
+      if (eventStatus !== null) {
+        res.writeHead(eventStatus).end()
+        return
+      }
       // Nagle would coalesce small frames into ~40 ms batches and the benchmark
       // would measure the kernel's buffering instead of the app's.
       req.socket.setNoDelay(true)
@@ -143,6 +160,12 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
       const { port } = server.address() as AddressInfo
       resolve({
         url: `http://127.0.0.1:${port}`,
+        eventRequests,
+        write: (raw) => stream?.write(raw),
+        drop: () => stream?.destroy(),
+        failEvents: (status) => {
+          eventStatus = status
+        },
         close: () =>
           new Promise<void>((done) => {
             stopTimer()

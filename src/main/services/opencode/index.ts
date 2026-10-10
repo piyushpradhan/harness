@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { createLogger } from '@shared/logger'
 import type { OpencodeStreamBatch, OpencodeStreamEvent } from '@shared/opencode-stream'
 
+import { fullJitterDelay } from './backoff'
 import { createBatcher } from './batch'
 import { SseDecoder } from './sse'
 
@@ -26,7 +27,11 @@ const PORT_ATTEMPTS = 4
 const HEALTH_TIMEOUT_MS = 2_000
 const HEALTH_POLL_MS = 250
 const HEALTH_POLLS = 60 // ~15s startup budget
-const RECONNECT_DELAY_MS = 1_000
+// Event-stream reconnects: full-jitter exponential backoff, 1 s → 30 s.
+// Ten consecutive failures (~1.5 min expected) is a server that is gone.
+const RECONNECT_BASE_MS = 1_000
+const RECONNECT_MAX_MS = 30_000
+const RECONNECT_ATTEMPTS = 10
 
 interface ServerInfo {
   url: string
@@ -71,8 +76,18 @@ function authHeaders(password: string): Record<string, string> {
   return { Authorization: `Basic ${token}` }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms)
+    signal?.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer)
+        resolve()
+      },
+      { once: true },
+    )
+  })
 }
 
 async function isHealthy(info: ServerInfo): Promise<boolean> {
@@ -262,11 +277,13 @@ async function approvePermission(
 async function connectEvents(
   info: ServerInfo,
   signal: AbortSignal,
+  lastEventId = '',
 ): Promise<ReadableStream<Uint8Array>> {
-  const res = await fetch(`${info.url}/api/event`, {
-    headers: authHeaders(info.password),
-    signal,
-  })
+  const headers = authHeaders(info.password)
+  // SSE resumption: a server that honors it replays what the drop lost. One
+  // that does not (OpenCode's bus today, as far as we know) ignores a header.
+  if (lastEventId) headers['Last-Event-ID'] = lastEventId
+  const res = await fetch(`${info.url}/api/event`, { headers, signal })
   if (!res.ok || !res.body) throw new Error(`event stream: HTTP ${res.status}`)
   return res.body
 }
@@ -294,18 +311,30 @@ function ensureStream(info: ServerInfo): Promise<void> {
   return streamOpen
 }
 
-/** Drain the open stream, reconnecting whenever it drops, until aborted. */
+/**
+ * Drain the open stream, reconnecting whenever it drops, until aborted. Gives
+ * up after `RECONNECT_ATTEMPTS` consecutive failures and tells the renderer,
+ * rather than retrying a dead server forever behind a silent spinner; the
+ * next `sendMessage` subscribes afresh.
+ */
 async function pump(
   info: ServerInfo,
   signal: AbortSignal,
   opened: ReadableStream<Uint8Array>,
 ): Promise<void> {
-  const decoder = new SseDecoder()
   let body: ReadableStream<Uint8Array> | null = opened
+  let lastEventId = ''
+  let attempt = 0
+  let lastError: unknown
   while (!signal.aborted) {
+    // Fresh per connection: a frame cut off by a drop must not prefix the
+    // first bytes of the next stream. Only the event id carries over.
+    const decoder = new SseDecoder({ lastEventId })
+    let reader: ReadableStreamDefaultReader<Uint8Array> | null = null
     try {
-      body ??= await connectEvents(info, signal)
-      const reader = body.getReader()
+      body ??= await connectEvents(info, signal, lastEventId)
+      attempt = 0
+      reader = body.getReader()
       for (;;) {
         const read = (await reader.read()) as { done: boolean; value?: Uint8Array }
         if (read.done || !read.value) break
@@ -323,12 +352,35 @@ async function pump(
           mapEvent(evt, (mapped) => batcher.push(mapped))
         }
       }
+      lastError = new Error('event stream closed by server')
     } catch (err) {
       if (signal.aborted) return
-      log.warn('event stream dropped, reconnecting', err)
+      lastError = err
+    } finally {
+      lastEventId = decoder.lastEventId
+      reader?.cancel().catch(() => undefined)
     }
     body = null
-    await sleep(RECONNECT_DELAY_MS)
+
+    if (attempt >= RECONNECT_ATTEMPTS) {
+      const reason = lastError instanceof Error ? lastError.message : String(lastError)
+      const message = `event stream lost after ${attempt} reconnect attempts: ${reason}`
+      log.error(message)
+      batcher.push({ type: 'error', message })
+      batcher.flush()
+      if (streamAbort?.signal === signal) {
+        streamAbort = null
+        streamOpen = null
+      }
+      return
+    }
+    const delayMs = fullJitterDelay(attempt++, RECONNECT_BASE_MS, RECONNECT_MAX_MS)
+    log.warn(
+      'event stream dropped, reconnecting',
+      { attempt, delayMs: Math.round(delayMs) },
+      lastError,
+    )
+    await sleep(delayMs, signal)
   }
 }
 
