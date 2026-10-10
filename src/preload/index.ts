@@ -38,8 +38,12 @@ const harness = {
     test: (id: string) => ipcRenderer.invoke('auth:test', id) as Promise<boolean>,
   },
   opencode: {
-    send: (text: string) =>
-      ipcRenderer.invoke('opencode:send', text) as Promise<{ ok: boolean; error?: string }>,
+    send: (text: string, requestId?: string) =>
+      ipcRenderer.invoke('opencode:send', text, requestId) as Promise<{
+        ok: boolean
+        requestId?: string
+        error?: string
+      }>,
     onStream: (callback: (batch: OpencodeStreamBatch) => void) => {
       const listener = (_event: unknown, batch: OpencodeStreamBatch) => {
         callback(batch)

@@ -30,6 +30,8 @@ export interface FakeOpencodeOptions {
    * so the benchmark's delta count stays deterministic.
    */
   startOnPrompt?: boolean
+  /** Admit prompts but emit nothing on its own; the caller drives the stream via `write`. */
+  manual?: boolean
   /** Port to listen on. Defaults to an ephemeral one. */
   port?: number
 }
@@ -94,7 +96,7 @@ export function startFakeOpencode(options: FakeOpencodeOptions): Promise<FakeOpe
   }
 
   const maybeStart = (): void => {
-    if (!prompted || timer) return
+    if (!prompted || timer || options.manual) return
     if (options.startOnPrompt) tick()
     else if (!stream) return
     timer = setInterval(tick, intervalMs)

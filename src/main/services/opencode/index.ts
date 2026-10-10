@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { randomBytes } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
 
 import { createLogger } from '@shared/logger'
 import type { OpencodeStreamBatch, OpencodeStreamEvent } from '@shared/opencode-stream'
@@ -71,6 +71,15 @@ let activeSessionID: string | null = null
 let streamAbort: AbortController | null = null
 /** Resolves once the event stream is subscribed; shared like `starting`. */
 let streamOpen: Promise<void> | null = null
+
+/**
+ * Admitted prompts whose execution has not ended, oldest first. The bus tags
+ * events with a session, not a prompt; OpenCode runs a session's prompts one
+ * at a time in admission order, so the head owns every event until its
+ * execution succeeds or fails. Each event leaves tagged with that id, which
+ * lets the renderer route by request instead of to "the latest message".
+ */
+const inflight: string[] = []
 
 /** Sink for batches leaving the service; wired to the renderer by main. */
 let streamSink: ((batch: OpencodeStreamBatch) => void) | null = null
@@ -230,9 +239,22 @@ function onChildExit(proc: ChildProcess, code: number | null, signal: string | n
   const message = `opencode serve exited unexpectedly (${signal ?? `code ${code}`})${tail ? `\n${tail}` : ''}`
   log.error(message)
   streamAbort?.abort()
+  failInflight(message)
   resetState()
-  batcher.push({ type: 'error', message })
+}
+
+/** Settle every request still waiting on the stream with `message`. */
+function failInflight(message: string): void {
+  if (inflight.length === 0) batcher.push({ type: 'error', message })
+  for (const requestId of inflight.splice(0)) batcher.push({ type: 'error', message, requestId })
   batcher.flush()
+}
+
+/** Tag with the request that owns the stream right now; release it at the end of its run. */
+function emitForHead(event: OpencodeStreamEvent): void {
+  const requestId = inflight[0]
+  if (requestId !== undefined) event.requestId = requestId
+  batcher.push(event)
 }
 
 function resetState(): void {
@@ -244,6 +266,7 @@ function resetState(): void {
   server = null
   sessionID = null
   activeSessionID = null
+  inflight.length = 0
 }
 
 /**
@@ -286,20 +309,33 @@ async function createSession(info: ServerInfo): Promise<string> {
   return sessionID
 }
 
-/** Admit a user message into the session. Events arrive via `onStreamEvent`. */
-export async function sendMessage(text: string): Promise<void> {
+/**
+ * Admit a user message into the session. Events arrive via `onStreamEvent`,
+ * tagged with `requestId` — the caller's own id for the message, or a
+ * generated one. Resolves to that id.
+ */
+export async function sendMessage(text: string, requestId: string = randomUUID()): Promise<string> {
   const info = await ensureServer()
   const id = await ensureSession(info)
-  // Set before the POST: the first events can arrive before its response does.
+  // Both set before the POST: the first events can arrive before its response.
   activeSessionID = id
+  inflight.push(requestId)
 
-  const res = await fetch(`${info.url}/api/session/${id}/prompt`, {
-    method: 'POST',
-    headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text }),
-  })
-  if (!res.ok) throw new Error(`prompt: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
-  log.info('message admitted', { sessionID: id })
+  try {
+    const res = await fetch(`${info.url}/api/session/${id}/prompt`, {
+      method: 'POST',
+      headers: { ...authHeaders(info.password), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    })
+    if (!res.ok) throw new Error(`prompt: HTTP ${res.status} ${(await res.text()).slice(0, 200)}`)
+  } catch (err) {
+    // Never admitted, so it will never run: it must not claim later events.
+    const index = inflight.indexOf(requestId)
+    if (index !== -1) inflight.splice(index, 1)
+    throw err
+  }
+  log.info('message admitted', { sessionID: id, requestId })
+  return requestId
 }
 
 function mapEvent(event: RawEvent, emit: (evt: OpencodeStreamEvent) => void): void {
@@ -427,10 +463,13 @@ async function pump(
             evt.data.id
           ) {
             const detail = `${evt.data.action ?? 'permission'} ${(evt.data.resources ?? []).join(', ')}`
-            batcher.push({ type: 'tool', state: 'running', detail })
+            emitForHead({ type: 'tool', state: 'running', detail })
             void approvePermission(info, evt.data.sessionID, evt.data.id)
           }
-          mapEvent(evt, (mapped) => batcher.push(mapped))
+          mapEvent(evt, (mapped) => {
+            emitForHead(mapped)
+            if (mapped.type === 'done' || mapped.type === 'error') inflight.shift()
+          })
         }
       }
       lastError = new Error('event stream closed by server')
@@ -447,8 +486,7 @@ async function pump(
       const reason = lastError instanceof Error ? lastError.message : String(lastError)
       const message = `event stream lost after ${attempt} reconnect attempts: ${reason}`
       log.error(message)
-      batcher.push({ type: 'error', message })
-      batcher.flush()
+      failInflight(message)
       if (streamAbort?.signal === signal) {
         streamAbort = null
         streamOpen = null

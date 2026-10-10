@@ -128,9 +128,11 @@ describe('event stream ordering', () => {
     process.env.HARNESS_OPENCODE_URL = fake.url
     const events = collect()
 
-    await sendMessage('hi')
+    const requestId = await sendMessage('hi')
 
-    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'first' }))
+    await vi.waitFor(() =>
+      expect(events).toContainEqual({ type: 'text', text: 'first', requestId }),
+    )
   })
 })
 
@@ -148,7 +150,7 @@ describe('event stream reconnect', () => {
   beforeEach(async () => {
     // Full jitter with a zero draw: every reconnect is immediate.
     vi.spyOn(Math, 'random').mockReturnValue(0)
-    fake = await startFakeOpencode({ deltas: 0, rate: 1000 })
+    fake = await startFakeOpencode({ deltas: 0, rate: 1000, manual: true })
     process.env.HARNESS_OPENCODE_URL = fake.url
   })
 
@@ -159,23 +161,25 @@ describe('event stream reconnect', () => {
 
   it('discards a frame cut off by a drop instead of corrupting the next one', async () => {
     const events = collect()
-    await sendMessage('hi')
+    const requestId = await sendMessage('hi')
 
     fake.write('data: {"type":"session.text.del')
     fake.drop()
     await vi.waitFor(() => expect(fake.eventRequests).toHaveLength(2))
     fake.write(frame(delta('after')))
 
-    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'after' }))
+    await vi.waitFor(() =>
+      expect(events).toContainEqual({ type: 'text', text: 'after', requestId }),
+    )
   })
 
   it('sends the last seen event id as Last-Event-ID on reconnect', async () => {
     const events = collect()
-    await sendMessage('hi')
+    const requestId = await sendMessage('hi')
 
     fake.write(frame(delta('one'), '41'))
     fake.write(frame(delta('two'), '42'))
-    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'two' }))
+    await vi.waitFor(() => expect(events).toContainEqual({ type: 'text', text: 'two', requestId }))
     fake.drop()
 
     await vi.waitFor(() => expect(fake.eventRequests).toHaveLength(2))
@@ -345,5 +349,90 @@ describe('process supervision', () => {
     await expect(ensureServer()).rejects.toThrow(/stopped/)
     await Promise.all(stops)
     expect(children[0].signalCode).toBe('SIGTERM')
+  })
+})
+
+describe('request correlation', () => {
+  let fake: FakeOpencode
+
+  function frame(payload: unknown): string {
+    return `data: ${JSON.stringify(payload)}\n\n`
+  }
+
+  const delta = (text: string): string =>
+    frame({ type: 'session.text.delta', data: { sessionID: FAKE_SESSION_ID, delta: text } })
+  const succeeded = frame({
+    type: 'session.execution.succeeded',
+    data: { sessionID: FAKE_SESSION_ID },
+  })
+  const failed = frame({ type: 'session.execution.failed', data: { sessionID: FAKE_SESSION_ID } })
+
+  beforeEach(async () => {
+    vi.spyOn(Math, 'random').mockReturnValue(0)
+    fake = await startFakeOpencode({ deltas: 0, rate: 1000, manual: true })
+    process.env.HARNESS_OPENCODE_URL = fake.url
+  })
+
+  afterEach(async () => {
+    vi.restoreAllMocks()
+    await fake.close()
+  })
+
+  it('tags every event with the request that caused it', async () => {
+    const events = collect()
+    await sendMessage('hi', 'req-1')
+
+    fake.write(delta('a'))
+    fake.write(succeeded)
+
+    await vi.waitFor(() => expect(events.at(-1)?.type).toBe('done'))
+    expect(events).toEqual([
+      { type: 'text', text: 'a', requestId: 'req-1' },
+      { type: 'done', requestId: 'req-1' },
+    ])
+  })
+
+  it('attributes overlapping requests in admission order', async () => {
+    const events = collect()
+    await sendMessage('first', 'req-1')
+    await sendMessage('second', 'req-2')
+
+    fake.write(delta('one'))
+    fake.write(succeeded)
+    fake.write(delta('two'))
+    fake.write(failed)
+
+    await vi.waitFor(() => expect(events).toHaveLength(4))
+    expect(events).toEqual([
+      { type: 'text', text: 'one', requestId: 'req-1' },
+      { type: 'done', requestId: 'req-1' },
+      { type: 'text', text: 'two', requestId: 'req-2' },
+      { type: 'error', message: 'execution failed', requestId: 'req-2' },
+    ])
+  })
+
+  it('generates a request id when the caller gives none', async () => {
+    const events = collect()
+    const requestId = await sendMessage('hi')
+
+    fake.write(succeeded)
+
+    expect(requestId).toMatch(/^[0-9a-f-]{36}$/)
+    await vi.waitFor(() => expect(events).toEqual([{ type: 'done', requestId }]))
+  })
+
+  it('settles every in-flight request when the stream is lost', async () => {
+    const events = collect()
+    await sendMessage('first', 'req-1')
+    await sendMessage('second', 'req-2')
+
+    fake.failEvents(503)
+    fake.drop()
+
+    await vi.waitFor(() => expect(events).toHaveLength(2))
+    expect(events.map((event) => [event.type, event.requestId])).toEqual([
+      ['error', 'req-1'],
+      ['error', 'req-2'],
+    ])
   })
 })
